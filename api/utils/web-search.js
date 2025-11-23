@@ -1,24 +1,51 @@
-const axios = require("axios");
+// api/utils/web-search.js
 
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_CX = process.env.GOOGLE_CX;
+
+/**
+ * Run a Google Custom Search for the given query.
+ * Returns a small array of { title, url, snippet } objects.
+ */
 async function webSearch(query) {
-  const url = "https://ddg-api.herokuapp.com/search"; // Free DuckDuckGo mirror
+  if (!GOOGLE_API_KEY || !GOOGLE_CX) {
+    console.warn(
+      "webSearch: GOOGLE_API_KEY or GOOGLE_CX missing, skipping web search."
+    );
+    return [];
+  }
+
+  const params = new URLSearchParams({
+    key: GOOGLE_API_KEY,
+    cx: GOOGLE_CX,
+    q: query,
+    num: "5", // top 5 results is enough context
+  });
+
+  const url = `https://www.googleapis.com/customsearch/v1?${params.toString()}`;
 
   try {
-    const response = await axios.get(url, {
-      params: { q: query }
-    });
+    const res = await fetch(url);
 
-    if (!response.data || !response.data.results) {
+    if (!res.ok) {
+      const text = await res.text();
+      console.error("webSearch: Google API error", res.status, text);
       return [];
     }
 
-    return response.data.results.slice(0, 5).map(r => ({
-      title: r.title,
-      url: r.url,
-      snippet: r.description || ""
+    const data = await res.json();
+
+    if (!Array.isArray(data.items)) {
+      return [];
+    }
+
+    return data.items.map((item) => ({
+      title: item.title,
+      url: item.link,
+      snippet: item.snippet || "",
     }));
   } catch (err) {
-    console.error("Search error:", err.message);
+    console.error("webSearch: request failed", err);
     return [];
   }
 }

@@ -2,14 +2,10 @@
 
 const OpenAI = require("openai");
 const { webSearch } = require("./utils/web-search");
-const { logInfo, logError } = require("./utils/logger");
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-
-// Default model comes from env, falls back to gpt-4.1-mini
-const MODEL = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
 
 // ---------------------------------------------------------------------------
 // System prompt
@@ -51,7 +47,7 @@ Output style:
   );
 }
 
-// Simple heuristic for when to trigger web search
+// Trigger search for certain queries
 function shouldUseSearch(message) {
   if (!message) return false;
   const lower = message.toLowerCase();
@@ -90,7 +86,6 @@ module.exports = async (req, res) => {
     try {
       body = JSON.parse(body);
     } catch (err) {
-      logError("exerbud_invalid_json_body", { errorMessage: err.message });
       return res.status(400).json({ error: "Invalid JSON in request body" });
     }
   }
@@ -109,19 +104,7 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
-  // Request metadata for logs
-  const requestId =
-    Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const startedAt = Date.now();
-
-  logInfo("exerbud_request_received", {
-    requestId,
-    messagePreview: userMessage.slice(0, 120),
-    historyCount: history.length,
-    attachmentsCount: attachments.length,
-  });
-
-  // ---------- Convert history for chat.completions ----------
+  // ---------- Convert history ----------
   const historyMessages = history
     .filter((h) => h && typeof h.content === "string")
     .map((h) => ({
@@ -129,7 +112,7 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
-  // ---------- Summarise attachments (names only, no raw data) ----------
+  // ---------- Attachment note ----------
   let attachmentNote = "";
   if (attachments.length > 0) {
     const lines = attachments.map((att, idx) => {
@@ -144,12 +127,9 @@ module.exports = async (req, res) => {
       lines.join("\n");
   }
 
-  // ---------- Optional web search ----------
+  // ---------- Web Search ----------
   let extraSearchContext = "";
-  let usedSearch = false;
-
   if (shouldUseSearch(userMessage)) {
-    usedSearch = true;
     try {
       const results = await webSearch(userMessage);
 
@@ -164,16 +144,12 @@ module.exports = async (req, res) => {
             .join("\n\n");
       } else {
         extraSearchContext =
-          "Note: A live web search was performed for this query but did not return any clearly useful results.";
+          "Note: A live web search was performed for this query but did not return useful results.";
       }
     } catch (err) {
-      logError("exerbud_web_search_failed", {
-        requestId,
-        errorMessage: err.message,
-      });
-
+      console.error("Web search failed:", err);
       extraSearchContext =
-        "Note: A live web search was attempted for this query, but it failed or is not configured. Answer based on general training data instead.";
+        "Note: A live web search was attempted but failed. Answer based on general knowledge instead.";
     }
   }
 
@@ -183,20 +159,17 @@ module.exports = async (req, res) => {
   const messages = [{ role: "system", content: systemPrompt }, ...historyMessages];
 
   if (attachmentNote) {
-    messages.push({
-      role: "system",
-      content: attachmentNote,
-    });
+    messages.push({ role: "system", content: attachmentNote });
   }
 
-  messages.push({
-    role: "user",
-    content: userMessage,
-  });
+  messages.push({ role: "user", content: userMessage });
+
+  // ---------- MODEL SELECTION (the nice tweak!) ----------
+  const modelName = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
 
   try {
     const completion = await client.chat.completions.create({
-      model: MODEL,
+      model: modelName,
       messages,
       temperature: 0.7,
       max_tokens: 900,
@@ -204,26 +177,11 @@ module.exports = async (req, res) => {
 
     const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
-      "I’m not sure what to say yet — try asking again with a bit more detail about your training.";
-
-    logInfo("exerbud_response_success", {
-      requestId,
-      durationMs: Date.now() - startedAt,
-      replyLength: reply.length,
-      usedSearch,
-      model: MODEL,
-    });
+      "I’m not sure what to say yet — try again with more detail.";
 
     return res.status(200).json({ reply });
   } catch (err) {
-    logError("exerbud_response_error", {
-      requestId,
-      durationMs: Date.now() - startedAt,
-      errorMessage: err.message,
-      stack: err.stack,
-      openaiStatus: err.status,
-    });
-
+    console.error("Exerbud AI backend error:", err);
     return res.status(500).json({
       error: "Exerbud backend failed.",
       details:
