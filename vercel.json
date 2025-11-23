@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "api/**/*.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/api/exerbud-ai", "dest": "/api/exerbud-ai.js" },
+    { "src": "/api/lannaex-ai", "dest": "/api/lannaex-ai.js" },
+    { "src": "/api/lannaex-business-ai", "dest": "/api/lannaex-business-ai.js" },
+    { "src": "/api/lannaex-fashion-ai", "dest": "/api/lannaex-fashion-ai.js" },
+    { "src": "/api/lannaex-fitness-ai", "dest": "/api/lannaex-fitness-ai.js" },
+    { "src": "/api/lannaex-life-management-ai", "dest": "/api/lannaex-life-management-ai.js" },
+    { "src": "/api/lannaex-property-ai", "dest": "/api/lannaex-property-ai.js" },
+    { "src": "/api/lannaex-travel-ai", "dest": "/api/lannaex-travel-ai.js" },
+    { "src": "/api/lannaex-wellness-ai", "dest": "/api/lannaex-wellness-ai.js" }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "exerbud-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "vercel dev",
+    "vercel-build": "echo \"No build step required\""
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.0.0",
+    "openai": "^4.104.0",
+    "axios": "^1.6.0"
+  }
+}
