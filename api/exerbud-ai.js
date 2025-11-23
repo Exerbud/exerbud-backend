@@ -7,6 +7,9 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Use env var for model, with safe fallback
+const EXERBUD_MODEL = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
+
 // ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
@@ -172,7 +175,7 @@ module.exports = async (req, res) => {
 
   try {
     const completion = await client.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: EXERBUD_MODEL,
       messages,
       temperature: 0.7,
       max_tokens: 900,
