@@ -41,6 +41,7 @@ Output style:
 - End with 2–4 clear "Next steps" so the user knows exactly what to do.
 - Whenever you provide a full, structured workout plan (multi-day program or detailed template), end with a short line such as:
   "If you’d like, I can also turn this into a downloadable PDF — just say something like “export this as a PDF.”"
+- When you share websites or links, ALWAYS write them as plain URLs like "https://example.com" with no Markdown link formatting. Do NOT use [text](url) syntax; just include the bare URL in the text.
 `.trim();
 
   if (!extraContext) return base;
@@ -402,9 +403,14 @@ module.exports = async (req, res) => {
       max_tokens: 900,
     });
 
-    const reply =
+    let reply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "I’m not sure what to say yet — try again with more detail.";
+
+    // Normalize any Markdown links [text](url) to just the bare URL
+    // e.g. "Website: [buffalostrength.com](https://buffalostrength.com/)"
+    // becomes "Website: https://buffalostrength.com/"
+    reply = reply.replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, "$2");
 
     return res.status(200).json({ reply });
   } catch (err) {
