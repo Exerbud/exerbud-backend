@@ -3,18 +3,102 @@
 const OpenAI = require("openai");
 const { webSearch } = require("./utils/web-search");
 const PDFDocument = require("pdfkit");
-const axios = require("axios");
+const https = require("https");
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Logo for PDF header
-const EXERBUD_LOGO_URL =
+const LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudlogoblackfavicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
 
 // ---------------------------------------------------------------------------
-// Helper: build system prompt
+// Helpers for PDF export
+// ---------------------------------------------------------------------------
+function fetchImageBuffer(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        if (res.statusCode !== 200) {
+          return reject(
+            new Error(`Image request failed with status ${res.statusCode}`)
+          );
+        }
+        const chunks = [];
+        res
+          .on("data", (d) => chunks.push(d))
+          .on("end", () => resolve(Buffer.concat(chunks)))
+          .on("error", reject);
+      })
+      .on("error", reject);
+  });
+}
+
+function cleanMarkdownForPdf(text) {
+  if (!text) return "";
+
+  let out = String(text);
+
+  // Remove markdown headings (### etc.)
+  out = out.replace(/^#{1,6}\s*/gm, "");
+
+  // Remove horizontal rules like --- or ___
+  out = out.replace(/^[-_]{3,}\s*$/gm, "");
+
+  // Un-bold **text**
+  out = out.replace(/\*\*(.+?)\*\*/g, "$1");
+
+  // Convert list markers "- " to bullets
+  out = out.replace(/^\s*-\s+/gm, "• ");
+
+  return out.trim();
+}
+
+async function handlePdfExport(res, body) {
+  const rawPlanText = body.planText || "";
+  const planTitle = body.planTitle || "Workout plan";
+  const cleanedPlan = cleanMarkdownForPdf(rawPlanText);
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader(
+    "Content-Disposition",
+    'attachment; filename="exerbud-workout-plan.pdf"'
+  );
+
+  const doc = new PDFDocument({ size: "LETTER", margin: 50 });
+  doc.pipe(res);
+
+  // Try to add logo (non-fatal if it fails)
+  try {
+    const buffer = await fetchImageBuffer(LOGO_URL);
+    doc.image(buffer, 50, 40, { width: 60 });
+    doc.moveDown(3);
+  } catch (e) {
+    doc.moveDown(1.5);
+  }
+
+  // Title
+  doc.fontSize(20).text("Exerbud", { align: "left" });
+  doc.moveDown(0.5);
+  doc
+    .fontSize(14)
+    .font("Helvetica-Bold")
+    .text(planTitle, { align: "left" });
+  doc.moveDown(1);
+
+  // Body text
+  doc.font("Helvetica").fontSize(12);
+  doc.text(cleanedPlan, {
+    align: "left",
+    lineGap: 4,
+    paragraphGap: 8,
+  });
+
+  doc.end();
+}
+
+// ---------------------------------------------------------------------------
+// System prompt
 // ---------------------------------------------------------------------------
 function buildExerbudSystemPrompt(extraContext) {
   const base = `
@@ -57,9 +141,7 @@ Output style:
   );
 }
 
-// ---------------------------------------------------------------------------
-// Helper: should we use web search?
-// ---------------------------------------------------------------------------
+// Trigger search for certain queries
 function shouldUseSearch(message) {
   if (!message) return false;
   const lower = message.toLowerCase();
@@ -73,119 +155,6 @@ function shouldUseSearch(message) {
     lower.includes("search") ||
     lower.startsWith("find ")
   );
-}
-
-// ---------------------------------------------------------------------------
-// Helpers: PDF generation
-// ---------------------------------------------------------------------------
-
-function normalizePlanTextForPdf(text) {
-  if (!text) return "";
-
-  let t = text;
-
-  // Remove Markdown-style headings like "### Monday – Upper"
-  t = t.replace(/^#{1,6}\s*/gm, "");
-
-  // Normalize HR lines like "---"
-  t = t.replace(/^---+\s*$/gm, "");
-
-  return t.trim();
-}
-
-function safeFileName(title) {
-  const base =
-    (title || "exerbud-workout-plan")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "exerbud-workout-plan";
-
-  return `${base}.pdf`;
-}
-
-async function generatePlanPdf(res, { planText, planTitle }) {
-  const cleaned = normalizePlanTextForPdf(planText || "");
-  const title = planTitle || "Exerbud Workout Plan";
-
-  if (!cleaned) {
-    res
-      .status(400)
-      .json({ error: "Missing or empty 'planText' for PDF export." });
-    return;
-  }
-
-  // Set headers for file download
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${safeFileName(title)}"`);
-
-  const doc = new PDFDocument({
-    size: "A4",
-    margins: { top: 70, bottom: 60, left: 60, right: 60 },
-  });
-
-  // Pipe PDF bytes straight to the response
-  doc.pipe(res);
-
-  // Try to draw logo
-  try {
-    const response = await axios.get(EXERBUD_LOGO_URL, {
-      responseType: "arraybuffer",
-    });
-    const imgBuffer = Buffer.from(response.data);
-    doc.image(imgBuffer, 60, 40, { width: 40 });
-  } catch (err) {
-    console.error("Failed to load logo for PDF:", err.message || err);
-  }
-
-  doc
-    .font("Helvetica-Bold")
-    .fontSize(18)
-    .text("Exerbud", 110, 46)
-    .moveDown(1);
-
-  doc
-    .font("Helvetica-Bold")
-    .fontSize(16)
-    .text(title, { align: "left" })
-    .moveDown(0.8);
-
-  doc
-    .moveTo(60, doc.y)
-    .lineTo(550, doc.y)
-    .strokeColor("#cccccc")
-    .stroke()
-    .moveDown(1);
-
-  doc.font("Helvetica").fontSize(11).fillColor("#000000");
-
-  const lines = cleaned.split(/\r?\n/);
-
-  lines.forEach((rawLine) => {
-    const line = rawLine.trim();
-
-    if (!line) {
-      doc.moveDown(0.4);
-      return;
-    }
-
-    // Bullet list: "- Something" or "• Something"
-    if (/^[-•]\s+/.test(line)) {
-      const text = line.replace(/^[-•]\s+/, "");
-      doc.text(`• ${text}`, { indent: 14 });
-      return;
-    }
-
-    // Simple inline headings if the line ended with ":" originally
-    if (/:$/.test(line)) {
-      doc.moveDown(0.4);
-      doc.font("Helvetica-Bold").text(line).font("Helvetica");
-      return;
-    }
-
-    doc.text(line);
-  });
-
-  doc.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -221,25 +190,17 @@ module.exports = async (req, res) => {
       .json({ error: "Request body must be a JSON object" });
   }
 
-  // ---------- PDF EXPORT MODE (no OpenAI call) ----------
-  const pdfExport = body.pdfExport === true;
-  if (pdfExport) {
-    const planText = (body.planText || "").toString();
-    const planTitle = (body.planTitle || "").toString();
-
+  // ---------- PDF export mode ----------
+  if (body.pdfExport) {
     try {
-      await generatePlanPdf(res, { planText, planTitle });
-      // IMPORTANT: return so we do not continue into the chat completion code
-      return;
+      await handlePdfExport(res, body);
+      return; // important: do not fall through to OpenAI call
     } catch (err) {
       console.error("PDF export failed:", err);
-      return res
-        .status(500)
-        .json({ error: "Failed to generate PDF for this plan." });
+      return res.status(500).json({ error: "Failed to generate PDF." });
     }
   }
 
-  // ---------- Normal chat mode ----------
   const userMessage = (body.message || "").trim();
   const history = Array.isArray(body.history) ? body.history : [];
   const attachments = Array.isArray(body.attachments) ? body.attachments : [];
@@ -248,7 +209,7 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
-  // Convert history
+  // ---------- Convert history ----------
   const historyMessages = history
     .filter((h) => h && typeof h.content === "string")
     .map((h) => ({
@@ -256,7 +217,7 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
-  // Attachment note
+  // ---------- Attachment note ----------
   let attachmentNote = "";
   if (attachments.length > 0) {
     const lines = attachments.map((att, idx) => {
@@ -271,7 +232,7 @@ module.exports = async (req, res) => {
       lines.join("\n");
   }
 
-  // Web Search
+  // ---------- Web Search ----------
   let extraSearchContext = "";
   if (shouldUseSearch(userMessage)) {
     try {
@@ -299,7 +260,7 @@ module.exports = async (req, res) => {
 
   const systemPrompt = buildExerbudSystemPrompt(extraSearchContext);
 
-  // Build messages
+  // ---------- Build messages ----------
   const messages = [{ role: "system", content: systemPrompt }, ...historyMessages];
 
   if (attachmentNote) {
@@ -308,7 +269,7 @@ module.exports = async (req, res) => {
 
   messages.push({ role: "user", content: userMessage });
 
-  // Model selection
+  // ---------- MODEL SELECTION ----------
   const modelName = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
 
   try {
