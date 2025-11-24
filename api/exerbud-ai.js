@@ -52,6 +52,14 @@ Output style:
   [[/PLACE_CARD]]
 
   After the cards, you can also give normal prose and extra tips. Do NOT use Markdown links inside the card; use plain URLs.
+
+IMPORTANT for PLACE_CARD:
+- You will see recent web search results in a JSON-like block, where each result may have fields such as "title", "url", "snippet", and "mapImageUrl".
+- When you create a [[PLACE_CARD]] block, you MUST use the exact values from that JSON data.
+- For the "website" field, copy the "url" field from the matching search result, as a plain https URL.
+- For the "map_image_url" field, ALWAYS copy the value of the "mapImageUrl" property from the matching search result, character-for-character, with no changes.
+- If a result object includes "mapImageUrl", you MUST include it as the "map_image_url" field in the PLACE_CARD. Never leave "map_image_url" blank when "mapImageUrl" exists.
+- NEVER invent or guess a map URL. If there is no "mapImageUrl" value in the search data, you may leave "map_image_url" blank or omit the card.
 `.trim();
 
   if (!extraContext) return base;
@@ -63,7 +71,7 @@ Output style:
     extraContext +
     "\n\nWhen you reference specific places or facts from this block, make it clear you're basing it on recent web search results, not your own memory. " +
     "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results. " +
-    "If any result includes a 'mapImageUrl' field, you should copy that value into the 'map_image_url' field inside your [[PLACE_CARD]] block for that place."
+    "If any result includes a 'mapImageUrl' field, you should copy that value exactly into the 'map_image_url' field inside your [[PLACE_CARD]] block for that place."
   );
 }
 
@@ -313,7 +321,10 @@ module.exports = async (req, res) => {
     }
   }
 
-  if (searchEnabled && shouldUseSearch(userMessage)) {
+  // Determine once whether this message should trigger a search
+  const didSearch = searchEnabled && shouldUseSearch(userMessage);
+
+  if (didSearch) {
     try {
       const searchResults = await webSearch(userMessage);
 
@@ -423,7 +434,10 @@ module.exports = async (req, res) => {
     // becomes "Website: https://buffalostrength.com/"
     reply = reply.replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, "$2");
 
-    return res.status(200).json({ reply });
+    return res.status(200).json({
+      reply,
+      searched: didSearch,
+    });
   } catch (err) {
     console.error("Exerbud AI backend error:", err);
     return res.status(500).json({
