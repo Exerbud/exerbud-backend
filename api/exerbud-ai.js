@@ -41,25 +41,6 @@ Output style:
 - End with 2–4 clear "Next steps" so the user knows exactly what to do.
 - Whenever you provide a full, structured workout plan (multi-day program or detailed template), end with a short line such as:
   "If you’d like, I can also turn this into a downloadable PDF — just say something like “export this as a PDF.”"
-- When you share websites or links, ALWAYS write them as plain URLs like "https://example.com" with no Markdown link formatting. Do NOT use [text](url) syntax; just include the bare URL in the text.
-- When you recommend specific gyms, studios, or trainers based on web search results, for each one output a small block in this exact format:
-
-  [[PLACE_CARD]]
-  name: <name>
-  website: <plain https URL to their main site>
-  map_image_url: <the mapImageUrl field from the web search results, if present; otherwise leave blank>
-  notes: <short bullets or sentences about why this is a good fit>
-  [[/PLACE_CARD]]
-
-  After the cards, you can also give normal prose and extra tips. Do NOT use Markdown links inside the card; use plain URLs.
-
-IMPORTANT for PLACE_CARD:
-- You will see recent web search results in a JSON-like block, where each result may have fields such as "title", "url", "snippet", and "mapImageUrl".
-- When you create a [[PLACE_CARD]] block, you MUST use the exact values from that JSON data.
-- For the "website" field, copy the "url" field from the matching search result, as a plain https URL.
-- For the "map_image_url" field, ALWAYS copy the value of the "mapImageUrl" property from the matching search result, character-for-character, with no changes.
-- If a result object includes "mapImageUrl", you MUST include it as the "map_image_url" field in the PLACE_CARD. Never leave "map_image_url" blank when "mapImageUrl" exists.
-- NEVER invent or guess a map URL. If there is no "mapImageUrl" value in the search data, you may leave "map_image_url" blank or omit the card.
 `.trim();
 
   if (!extraContext) return base;
@@ -70,8 +51,7 @@ IMPORTANT for PLACE_CARD:
     "Additional live context from a recent web search (treat as external info, not absolute truth):\n" +
     extraContext +
     "\n\nWhen you reference specific places or facts from this block, make it clear you're basing it on recent web search results, not your own memory. " +
-    "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results. " +
-    "If any result includes a 'mapImageUrl' field, you should copy that value exactly into the 'map_image_url' field inside your [[PLACE_CARD]] block for that place."
+    "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results."
   );
 }
 
@@ -308,11 +288,9 @@ module.exports = async (req, res) => {
   }
 
   // ---------- Optional web search ----------
-  // Frontend sends enableSearch: true; allow backend override by setting it false.
   const searchEnabled = body.enableSearch !== false;
   let extraSearchContext = "";
 
-  // Allow client to send any existing extraSearchContext if desired
   if (body.extraSearchContext) {
     try {
       extraSearchContext = String(body.extraSearchContext);
@@ -321,10 +299,7 @@ module.exports = async (req, res) => {
     }
   }
 
-  // Determine once whether this message should trigger a search
-  const didSearch = searchEnabled && shouldUseSearch(userMessage);
-
-  if (didSearch) {
+  if (searchEnabled && shouldUseSearch(userMessage)) {
     try {
       const searchResults = await webSearch(userMessage);
 
@@ -407,7 +382,6 @@ module.exports = async (req, res) => {
     messages.push({ role: "system", content: attachmentNote });
   }
 
-  // Image messages (if any) come before the latest user text
   if (imageMessages.length > 0) {
     messages.push(...imageMessages);
   }
@@ -425,19 +399,11 @@ module.exports = async (req, res) => {
       max_tokens: 900,
     });
 
-    let reply =
+    const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "I’m not sure what to say yet — try again with more detail.";
 
-    // Normalize any Markdown links [text](url) to just the bare URL
-    // e.g. "Website: [buffalostrength.com](https://buffalostrength.com/)"
-    // becomes "Website: https://buffalostrength.com/"
-    reply = reply.replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, "$2");
-
-    return res.status(200).json({
-      reply,
-      searched: didSearch,
-    });
+    return res.status(200).json({ reply });
   } catch (err) {
     console.error("Exerbud AI backend error:", err);
     return res.status(500).json({
