@@ -72,19 +72,6 @@ function shouldUseSearch(message) {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: strip markdown links so frontend auto-linker doesn't double them
-// ---------------------------------------------------------------------------
-function stripMarkdownLinks(text) {
-  if (!text || typeof text !== "string") return text;
-
-  // Replace [label](https://url...) with just the URL
-  return text.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)[^)]*\)/g,
-    "$2"
-  );
-}
-
-// ---------------------------------------------------------------------------
 // PDF helpers
 // ---------------------------------------------------------------------------
 
@@ -296,7 +283,8 @@ module.exports = async (req, res) => {
   const history = Array.isArray(body.history) ? body.history : [];
   const attachments = Array.isArray(body.attachments) ? body.attachments : [];
 
-  if (!userMessage) {
+  // Allow either text OR at least one attachment; only error if both missing
+  if (!userMessage && attachments.length === 0) {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
@@ -399,7 +387,13 @@ module.exports = async (req, res) => {
     messages.push(...imageMessages);
   }
 
-  messages.push({ role: "user", content: userMessage });
+  // If there was no typed message but there ARE attachments, give the model
+  // a short textual stub so it understands what's happening.
+  const lastUserContent =
+    userMessage ||
+    "The user sent one or more attachments without any typed message. Use them as context for your reply.";
+
+  messages.push({ role: "user", content: lastUserContent });
 
   // ---------- MODEL SELECTION ----------
   const modelName = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
@@ -412,12 +406,9 @@ module.exports = async (req, res) => {
       max_tokens: 900,
     });
 
-    const rawReply =
+    const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "I’m not sure what to say yet — try again with more detail.";
-
-    // Strip markdown links so the frontend auto-linker doesn't double them
-    const reply = stripMarkdownLinks(rawReply);
 
     return res.status(200).json({ reply });
   } catch (err) {
