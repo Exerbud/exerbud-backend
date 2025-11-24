@@ -2,13 +2,19 @@
 
 const OpenAI = require("openai");
 const { webSearch } = require("./utils/web-search");
+const PDFDocument = require("pdfkit");
+const axios = require("axios");
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Logo for PDF header
+const EXERBUD_LOGO_URL =
+  "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudlogoblackfavicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
+
 // ---------------------------------------------------------------------------
-// System prompt
+// Helper: build system prompt
 // ---------------------------------------------------------------------------
 function buildExerbudSystemPrompt(extraContext) {
   const base = `
@@ -51,7 +57,9 @@ Output style:
   );
 }
 
-// Trigger search for certain queries
+// ---------------------------------------------------------------------------
+// Helper: should we use web search?
+// ---------------------------------------------------------------------------
 function shouldUseSearch(message) {
   if (!message) return false;
   const lower = message.toLowerCase();
@@ -65,6 +73,119 @@ function shouldUseSearch(message) {
     lower.includes("search") ||
     lower.startsWith("find ")
   );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: PDF generation
+// ---------------------------------------------------------------------------
+
+function normalizePlanTextForPdf(text) {
+  if (!text) return "";
+
+  let t = text;
+
+  // Remove Markdown-style headings like "### Monday – Upper"
+  t = t.replace(/^#{1,6}\s*/gm, "");
+
+  // Normalize HR lines like "---"
+  t = t.replace(/^---+\s*$/gm, "");
+
+  return t.trim();
+}
+
+function safeFileName(title) {
+  const base =
+    (title || "exerbud-workout-plan")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "exerbud-workout-plan";
+
+  return `${base}.pdf`;
+}
+
+async function generatePlanPdf(res, { planText, planTitle }) {
+  const cleaned = normalizePlanTextForPdf(planText || "");
+  const title = planTitle || "Exerbud Workout Plan";
+
+  if (!cleaned) {
+    res
+      .status(400)
+      .json({ error: "Missing or empty 'planText' for PDF export." });
+    return;
+  }
+
+  // Set headers for file download
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${safeFileName(title)}"`);
+
+  const doc = new PDFDocument({
+    size: "A4",
+    margins: { top: 70, bottom: 60, left: 60, right: 60 },
+  });
+
+  // Pipe PDF bytes straight to the response
+  doc.pipe(res);
+
+  // Try to draw logo
+  try {
+    const response = await axios.get(EXERBUD_LOGO_URL, {
+      responseType: "arraybuffer",
+    });
+    const imgBuffer = Buffer.from(response.data);
+    doc.image(imgBuffer, 60, 40, { width: 40 });
+  } catch (err) {
+    console.error("Failed to load logo for PDF:", err.message || err);
+  }
+
+  doc
+    .font("Helvetica-Bold")
+    .fontSize(18)
+    .text("Exerbud", 110, 46)
+    .moveDown(1);
+
+  doc
+    .font("Helvetica-Bold")
+    .fontSize(16)
+    .text(title, { align: "left" })
+    .moveDown(0.8);
+
+  doc
+    .moveTo(60, doc.y)
+    .lineTo(550, doc.y)
+    .strokeColor("#cccccc")
+    .stroke()
+    .moveDown(1);
+
+  doc.font("Helvetica").fontSize(11).fillColor("#000000");
+
+  const lines = cleaned.split(/\r?\n/);
+
+  lines.forEach((rawLine) => {
+    const line = rawLine.trim();
+
+    if (!line) {
+      doc.moveDown(0.4);
+      return;
+    }
+
+    // Bullet list: "- Something" or "• Something"
+    if (/^[-•]\s+/.test(line)) {
+      const text = line.replace(/^[-•]\s+/, "");
+      doc.text(`• ${text}`, { indent: 14 });
+      return;
+    }
+
+    // Simple inline headings if the line ended with ":" originally
+    if (/:$/.test(line)) {
+      doc.moveDown(0.4);
+      doc.font("Helvetica-Bold").text(line).font("Helvetica");
+      return;
+    }
+
+    doc.text(line);
+  });
+
+  doc.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +221,25 @@ module.exports = async (req, res) => {
       .json({ error: "Request body must be a JSON object" });
   }
 
+  // ---------- PDF EXPORT MODE (no OpenAI call) ----------
+  const pdfExport = body.pdfExport === true;
+  if (pdfExport) {
+    const planText = (body.planText || "").toString();
+    const planTitle = (body.planTitle || "").toString();
+
+    try {
+      await generatePlanPdf(res, { planText, planTitle });
+      // IMPORTANT: return so we do not continue into the chat completion code
+      return;
+    } catch (err) {
+      console.error("PDF export failed:", err);
+      return res
+        .status(500)
+        .json({ error: "Failed to generate PDF for this plan." });
+    }
+  }
+
+  // ---------- Normal chat mode ----------
   const userMessage = (body.message || "").trim();
   const history = Array.isArray(body.history) ? body.history : [];
   const attachments = Array.isArray(body.attachments) ? body.attachments : [];
@@ -108,7 +248,7 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
-  // ---------- Convert history ----------
+  // Convert history
   const historyMessages = history
     .filter((h) => h && typeof h.content === "string")
     .map((h) => ({
@@ -116,7 +256,7 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
-  // ---------- Attachment note ----------
+  // Attachment note
   let attachmentNote = "";
   if (attachments.length > 0) {
     const lines = attachments.map((att, idx) => {
@@ -131,7 +271,7 @@ module.exports = async (req, res) => {
       lines.join("\n");
   }
 
-  // ---------- Web Search ----------
+  // Web Search
   let extraSearchContext = "";
   if (shouldUseSearch(userMessage)) {
     try {
@@ -159,7 +299,7 @@ module.exports = async (req, res) => {
 
   const systemPrompt = buildExerbudSystemPrompt(extraSearchContext);
 
-  // ---------- Build messages ----------
+  // Build messages
   const messages = [{ role: "system", content: systemPrompt }, ...historyMessages];
 
   if (attachmentNote) {
@@ -168,7 +308,7 @@ module.exports = async (req, res) => {
 
   messages.push({ role: "user", content: userMessage });
 
-  // ---------- MODEL SELECTION ----------
+  // Model selection
   const modelName = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
 
   try {

@@ -1,27 +1,90 @@
 // api/exerbud-pdf.js
+// Creates a simple, nicely formatted PDF from the last plan
 
 const PDFDocument = require("pdfkit");
 const https = require("https");
 
-const LOGO_URL = "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudlogoblackfavicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
+const LOGO_URL =
+  "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudlogoblackfavicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
 
 function fetchImageBuffer(url) {
   return new Promise((resolve, reject) => {
     https
-      .get(url, (resp) => {
-        if (resp.statusCode !== 200) {
-          return reject(new Error("Failed to load image: " + resp.statusCode));
+      .get(url, (res) => {
+        if (res.statusCode !== 200) {
+          return reject(new Error("Failed to fetch logo, status " + res.statusCode));
         }
         const data = [];
-        resp.on("data", (chunk) => data.push(chunk));
-        resp.on("end", () => resolve(Buffer.concat(data)));
+        res.on("data", (chunk) => data.push(chunk));
+        res.on("end", () => resolve(Buffer.concat(data)));
       })
       .on("error", reject);
   });
 }
 
+function writePlanContent(doc, content) {
+  const lines = String(content || "").split(/\r?\n/);
+
+  lines.forEach((lineRaw) => {
+    const line = lineRaw.replace(/\s+$/g, "");
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      doc.moveDown(0.4);
+      return;
+    }
+
+    // Horizontal rule
+    if (trimmed === "---") {
+      doc.moveDown(0.3);
+      doc
+        .moveTo(doc.x, doc.y)
+        .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+        .strokeColor("#dddddd")
+        .lineWidth(1)
+        .stroke()
+        .strokeColor("#000000")
+        .moveDown(0.4);
+      return;
+    }
+
+    // Headings: #, ##, ###, ####
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const text = headingMatch[2];
+
+      const baseSize = 14;
+      const size = Math.max(12, baseSize + (3 - Math.min(level, 3)));
+
+      doc.moveDown(0.4);
+      doc.font("Helvetica-Bold").fontSize(size).text(text, { width: 500 });
+      doc.font("Helvetica").fontSize(12);
+      return;
+    }
+
+    // Bullet list items: -, *, •
+    if (/^[-*•]\s+/.test(trimmed)) {
+      const bulletText = trimmed.replace(/^[-*•]\s+/, "");
+      doc
+        .font("Helvetica")
+        .fontSize(12)
+        .text("• " + bulletText, {
+          width: 500,
+          indent: 18,
+        });
+      return;
+    }
+
+    // Fallback normal paragraph
+    doc.font("Helvetica").fontSize(12).text(trimmed, {
+      width: 500,
+    });
+  });
+}
+
 module.exports = async (req, res) => {
-  // Basic CORS (mirror exerbud-ai.js)
+  // Basic CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -34,7 +97,6 @@ module.exports = async (req, res) => {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // Parse body
   let body = req.body;
   if (typeof body === "string") {
     try {
@@ -44,134 +106,65 @@ module.exports = async (req, res) => {
     }
   }
 
-  if (!body || typeof body !== "object") {
-    return res
-      .status(400)
-      .json({ error: "Request body must be a JSON object" });
-  }
-
-  const content = (body.content || "").trim();
-  const title = (body.title || "").trim() || "Your Exerbud Plan";
-
-  if (!content) {
-    return res.status(400).json({ error: "Missing 'content' in body" });
-  }
+  const content = body?.content || "";
+  const title = (body?.title || "Current plan from Exerbud").trim();
 
   try {
-    // Response headers for download
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="exerbud-plan.pdf"'
-    );
+    // Fetch logo
+    const logoBuffer = await fetchImageBuffer(LOGO_URL);
 
+    // Create PDF
     const doc = new PDFDocument({
       size: "A4",
-      margin: 50,
+      margins: { top: 60, left: 50, right: 50, bottom: 60 },
     });
 
-    // Stream PDF directly to response
-    doc.pipe(res);
+    const chunks = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => {
+      const pdfBuffer = Buffer.concat(chunks);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="exerbud-plan.pdf"'
+      );
+      res.status(200).send(pdfBuffer);
+    });
 
-    // Try to load and render logo from remote URL
+    // Header with logo & brand
     try {
-      const logoBuffer = await fetchImageBuffer(LOGO_URL);
-      if (logoBuffer) {
-        doc.image(logoBuffer, 50, 40, { width: 120 });
-        doc.moveDown(2.2);
-      }
+      doc.image(logoBuffer, 50, 40, { width: 40 });
     } catch (e) {
-      console.warn("Exerbud PDF: logo load failed:", e.message);
-      // Safe to continue without logo
-      doc.moveDown(1.0);
+      console.error("Failed to draw logo in PDF:", e);
     }
 
-    // Header text
     doc
-      .fontSize(18)
       .font("Helvetica-Bold")
-      .text("Exerbud – Workout / Training Plan", { align: "center" })
-      .moveDown(0.5);
+      .fontSize(18)
+      .text("EXERBUD", 100, 46, { continued: false });
 
+    doc.moveDown(1.4);
     doc
-      .fontSize(13)
+      .font("Helvetica-Bold")
+      .fontSize(14)
+      .text(title, { width: 500 });
+
+    doc.moveDown(0.5);
+    doc
       .font("Helvetica")
-      .text(title, { align: "center" })
-      .moveDown(1.5);
+      .fontSize(10)
+      .fillColor("#555555")
+      .text("Generated by Exerbud AI", { width: 500 });
 
-    // --- Simple markdown-ish formatting of the content ---
-    const lines = content.split(/\r?\n/);
+    doc.fillColor("#000000");
+    doc.moveDown(1);
 
-    const normalFont = () => {
-      doc.font("Helvetica").fontSize(11);
-    };
-
-    lines.forEach((rawLine) => {
-      const line = rawLine.trim();
-
-      if (!line) {
-        doc.moveDown(0.4);
-        return;
-      }
-
-      // Headings
-      if (line.startsWith("### ")) {
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(12)
-          .text(line.slice(4))
-          .moveDown(0.25);
-        normalFont();
-        return;
-      }
-
-      if (line.startsWith("## ")) {
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(13)
-          .text(line.slice(3))
-          .moveDown(0.25);
-        normalFont();
-        return;
-      }
-
-      if (line.startsWith("# ")) {
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(14)
-          .text(line.slice(2))
-          .moveDown(0.3);
-        normalFont();
-        return;
-      }
-
-      // Bullet points "- ..."
-      if (line.startsWith("- ")) {
-        normalFont();
-        const text = line.slice(2);
-        doc.text("• " + text, {
-          continued: false,
-        });
-        return;
-      }
-
-      // Default paragraph
-      normalFont();
-      doc.text(line, { align: "left" }).moveDown(0.1);
-    });
-
-    // Footer
-    doc
-      .moveDown(2)
-      .fontSize(9)
-      .fillColor("#888888")
-      .text("Generated by Exerbud AI", { align: "center" });
+    // Body
+    writePlanContent(doc, content);
 
     doc.end();
   } catch (err) {
-    console.error("Exerbud PDF backend error:", err);
-    if (!res.headersSent) {
-      return res.status(500).json({ error: "Failed to generate PDF" });
-    }
+    console.error("PDF generation error:", err);
+    res.status(500).json({ error: "Failed to generate PDF." });
   }
 };
