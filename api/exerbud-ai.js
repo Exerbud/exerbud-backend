@@ -26,6 +26,7 @@ You can:
 - Suggest sustainable programming (not extreme).
 - Help with exercise selection, sets/reps, weekly splits, progression, deloads.
 - Interpret descriptions of gym equipment, constraints, and schedules.
+- When the user uploads photos or screenshots (e.g., form videos, progress pics, equipment photos), you can visually inspect them and describe what you see to help with form cues and practical advice.
 - With help from the Exerbud app, export the latest workout plan as a downloadable PDF whenever the user asks (e.g., "export this as a PDF", "turn this into a PDF").
 
 Limits & safety:
@@ -91,73 +92,29 @@ function fetchImageBuffer(url) {
 }
 
 /**
- * Normalize the AI's markdown-ish workout text for the PDF:
- * - Strip leading markdown hashes (###, ##, #)
- * - Remove horizontal rules (---)
- * - Convert "- " bullets to "• "
- * - Collapse multiple blank lines
- * - Give headings a bit more visual weight (we'll upper-case them)
+ * Light cleanup for plan text going into PDF:
+ * - remove markdown headings (#, ##, ###)
+ * - remove horizontal rules (---)
+ * - collapse big runs of blank lines
  */
-function normalizePlanTextForPdf(planText) {
-  const lines = String(planText || "")
-    .split(/\r?\n/)
-    .map((l) => l.replace(/\s+$/g, "")); // trim right side only
+function normalizePlanText(raw) {
+  if (!raw) return "";
 
-  const outLines = [];
-  let lastWasBlank = false;
+  let text = String(raw);
 
-  for (let line of lines) {
-    const trimmed = line.trim();
+  // Normalise newlines
+  text = text.replace(/\r\n/g, "\n");
 
-    // Blank line
-    if (!trimmed) {
-      if (!lastWasBlank && outLines.length) {
-        outLines.push(""); // single blank line
-      }
-      lastWasBlank = true;
-      continue;
-    }
+  // Strip markdown headings at start of line
+  text = text.replace(/^#{1,6}\s*/gm, "");
 
-    // Horizontal rule like --- or ------
-    if (/^-{3,}$/.test(trimmed)) {
-      if (!lastWasBlank && outLines.length) {
-        outLines.push("");
-      }
-      lastWasBlank = true;
-      continue;
-    }
+  // Remove lines that are just --- or similar
+  text = text.replace(/^-{3,}\s*$/gm, "");
 
-    // Headings: #, ##, ### etc
-    if (/^#{1,6}\s+/.test(trimmed)) {
-      const headingText = trimmed.replace(/^#{1,6}\s+/, "").trim();
-      if (outLines.length && !lastWasBlank) {
-        outLines.push("");
-      }
-      outLines.push(headingText.toUpperCase()); // slightly louder in PDF
-      outLines.push(""); // blank after heading
-      lastWasBlank = true;
-      continue;
-    }
+  // Collapse 3+ blank lines -> 2
+  text = text.replace(/\n{3,}/g, "\n\n");
 
-    // Bullets: "- Something" -> "• Something"
-    if (trimmed.startsWith("- ")) {
-      const bullet = "• " + trimmed.slice(2);
-      outLines.push(bullet);
-      lastWasBlank = false;
-      continue;
-    }
-
-    // Normal line
-    outLines.push(trimmed);
-    lastWasBlank = false;
-  }
-
-  // Remove trailing blank lines
-  while (outLines.length && outLines[outLines.length - 1] === "") {
-    outLines.pop();
-  }
-
-  return outLines.join("\n");
+  return text.trim();
 }
 
 /**
@@ -165,12 +122,11 @@ function normalizePlanTextForPdf(planText) {
  * - Logo only (no "Exerbud" word under it)
  * - Title line without repeating the brand
  * - Tight, consistent spacing between paragraphs
- * - Markdown cleaned (no ###, no ---; bullets become •)
  */
 async function generatePlanPdf(planText, planTitle) {
   const doc = new PDFDocument({
     size: "LETTER",
-    margins: { top: 56, bottom: 56, left: 64, right: 64 },
+    margins: { top: 64, bottom: 64, left: 64, right: 64 },
   });
 
   const buffers = [];
@@ -187,13 +143,13 @@ async function generatePlanPdf(planText, planTitle) {
   try {
     const logoBuffer = await fetchImageBuffer(EXERBUD_LOGO_URL);
     // Logo only, no text under it
-    doc.image(logoBuffer, doc.page.margins.left, currentY - 16, { width: 60 });
+    doc.image(logoBuffer, doc.page.margins.left, currentY - 20, { width: 60 });
   } catch (e) {
     // If logo fails, just skip it silently
     console.error("Logo fetch failed (non-fatal):", e.message || e);
   }
 
-  // Title (without "Exerbud" word)
+  // Title to the right of / below the logo
   const cleanedTitle =
     (planTitle || "Workout plan").replace(/exerbud\s*/i, "").trim() ||
     "Workout plan";
@@ -201,21 +157,18 @@ async function generatePlanPdf(planText, planTitle) {
   doc
     .font("Helvetica-Bold")
     .fontSize(18)
-    .text(cleanedTitle, doc.page.margins.left, currentY + 42);
+    .text(cleanedTitle, doc.page.margins.left, currentY + 40);
 
   // Small gap before body
   doc.moveDown(1);
 
-  // --- Body text ---
+  // --- Body text: split into paragraphs by blank lines, use modest gaps ---
   doc.font("Helvetica").fontSize(11);
 
   const availableWidth =
     doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-  const normalized = normalizePlanTextForPdf(planText || "");
-
-  // paragraphs separated by blank lines
-  const paragraphs = normalized
+  const paragraphs = normalizePlanText(planText)
     .split(/\n{2,}/)
     .map((p) => p.trim())
     .filter(Boolean);
@@ -224,12 +177,12 @@ async function generatePlanPdf(planText, planTitle) {
     doc.text(para, {
       width: availableWidth,
       align: "left",
-      lineGap: 2, // tighter line spacing inside paragraphs
+      lineGap: 3, // line spacing inside paragraph
     });
 
-    // Smaller paragraph gap to avoid huge white space
+    // Smaller paragraph gap so there isn't huge white space
     if (idx !== paragraphs.length - 1) {
-      doc.moveDown(0.5);
+      doc.moveDown(0.7);
     }
   });
 
@@ -304,6 +257,19 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
+  // Split attachments into images vs everything else
+  const imageAttachments = attachments.filter(
+    (att) =>
+      att &&
+      typeof att === "object" &&
+      /^image\//.test(att.type || "") &&
+      att.data
+  );
+
+  const nonImageAttachments = attachments.filter(
+    (att) => !imageAttachments.includes(att)
+  );
+
   // ---------- Convert history ----------
   const historyMessages = history
     .filter((h) => h && typeof h.content === "string")
@@ -323,7 +289,7 @@ module.exports = async (req, res) => {
     });
 
     attachmentNote =
-      "The user also uploaded these files (you cannot see the image pixels or file contents directly; treat them as described context only):\n" +
+      "The user also uploaded these files. If any are images, you can visually inspect them to give more concrete, practical feedback:\n" +
       lines.join("\n");
   }
 
@@ -356,18 +322,42 @@ module.exports = async (req, res) => {
   const systemPrompt = buildExerbudSystemPrompt(extraSearchContext);
 
   // ---------- Build messages ----------
-  const messages = [
-    { role: "system", content: systemPrompt },
-    ...historyMessages,
-  ];
+  const messages = [{ role: "system", content: systemPrompt }, ...historyMessages];
 
   if (attachmentNote) {
     messages.push({ role: "system", content: attachmentNote });
   }
 
-  messages.push({ role: "user", content: userMessage });
+  // Build user content: text + any images
+  const userContent = [];
+
+  if (userMessage) {
+    userContent.push({
+      type: "text",
+      text: userMessage,
+    });
+  }
+
+  // For each image attachment, send as an input_image with data URL
+  imageAttachments.forEach((att) => {
+    const mime = att.type || "image/png";
+    const base64 = att.data; // from frontend: raw base64, no prefix
+    if (!base64) return;
+
+    userContent.push({
+      type: "input_image",
+      image_url: {
+        // The hosting layer (or OpenAI) will accept data URLs directly
+        url: `data:${mime};base64,${base64}`,
+      },
+    });
+  });
+
+  // If for some reason there are no images, we still have text content
+  messages.push({ role: "user", content: userContent });
 
   // ---------- MODEL SELECTION ----------
+  // gpt-4.1-mini is multimodal and can see images
   const modelName = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
 
   try {
