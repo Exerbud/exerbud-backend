@@ -10,6 +10,14 @@ const client = new OpenAI({
 });
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const DEFAULT_MODEL = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
+const MAX_HISTORY_MESSAGES = 20;
+const MAX_SEARCH_CONTEXT_CHARS = 8000;
+const MAX_ATTACHMENTS = 8;
+
+// ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
 function buildExerbudSystemPrompt(extraContext) {
@@ -31,9 +39,9 @@ You can:
 
 Limits & safety:
 - Do NOT diagnose injuries or medical issues and never prescribe drugs.
-- If something sounds medically serious, tell them to talk to a qualified professional.
+- If something sounds medically serious, tell the user to talk to a qualified professional.
 - Be explicit when you are making reasonable assumptions.
-- IMPORTANT: Do NOT say you are unable to create or send files or PDFs. Assume the Exerbud app can handle exporting and downloading plans for the user.
+- IMPORTANT: Do NOT say you are unable to create or send files or PDFs. The Exerbud app can handle exporting and downloading plans for the user.
 
 Output style:
 - Start with 1–2 sentences reflecting what you understood.
@@ -50,12 +58,14 @@ Output style:
     "\n\n" +
     "Additional live context from a recent web search (treat as external info, not absolute truth):\n" +
     extraContext +
-    "\n\nWhen you reference specific places or facts from this block, make it clear you're basing it on recent web search results, not your own memory. " +
+    "\n\nWhen you reference specific places or facts from this block, make it clear you are basing it on recent web search results, not your own memory. " +
     "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results."
   );
 }
 
+// ---------------------------------------------------------------------------
 // Trigger search for certain queries
+// ---------------------------------------------------------------------------
 function shouldUseSearch(message) {
   if (!message) return false;
   const lower = message.toLowerCase();
@@ -66,6 +76,8 @@ function shouldUseSearch(message) {
     lower.includes("find gym") ||
     lower.includes("yoga studio") ||
     lower.includes("class near me") ||
+    lower.includes("personal trainer") ||
+    lower.includes("trainer near me") ||
     lower.includes("search") ||
     lower.startsWith("find ")
   );
@@ -74,9 +86,8 @@ function shouldUseSearch(message) {
 // ---------------------------------------------------------------------------
 // PDF helpers
 // ---------------------------------------------------------------------------
-
 const EXERBUD_LOGO_URL =
-  "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudlogoblackfavicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
+  "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbud_favicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
 
 function fetchImageBuffer(url) {
   return new Promise((resolve, reject) => {
@@ -130,19 +141,18 @@ function normalizePlanTextForPdf(raw) {
       continue;
     }
 
-    // Bullet lines: "- text", "-- text", etc.
-    const bulletMatch = trimmed.match(/^-+\s*(.+)$/);
-    if (bulletMatch) {
-      out.push("• " + bulletMatch[1].trim());
-      lastBlank = false;
-      continue;
+    // Bullet lines: "- text"
+    if (/^-+\s+/.test(trimmed)) {
+      trimmed = "• " + trimmed.replace(/^-\s+/, "");
     }
 
     out.push(trimmed);
     lastBlank = false;
   }
 
-  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  // Collapse multiple blank lines
+  const joined = out.join("\n");
+  return joined.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /**
@@ -158,34 +168,39 @@ async function generatePlanPdf(planText, planTitle) {
   });
 
   const buffers = [];
-  doc.on("data", (b) => buffers.push(b));
-
+  doc.on("data", (chunk) => buffers.push(chunk));
   const pdfPromise = new Promise((resolve, reject) => {
     doc.on("end", () => resolve(Buffer.concat(buffers)));
     doc.on("error", reject);
   });
 
-  // --- Header with logo + title ---
-  let currentY = doc.page.margins.top;
+  // --- Header: logo + title ---
+  let currentY = doc.y;
 
   try {
     const logoBuffer = await fetchImageBuffer(EXERBUD_LOGO_URL);
-    // Logo only, no text under it
-    doc.image(logoBuffer, doc.page.margins.left, currentY - 20, { width: 60 });
-  } catch (e) {
-    // If logo fails, just skip it silently
-    console.error("Logo fetch failed (non-fatal):", e.message || e);
+    const logoSize = 32;
+    doc.image(
+      logoBuffer,
+      doc.page.margins.left,
+      currentY,
+      { width: logoSize, height: logoSize }
+    );
+  } catch (err) {
+    console.error("Failed to fetch Exerbud logo for PDF:", err);
   }
 
-  // Title to the right of / below the logo
   const cleanedTitle =
-    (planTitle || "Workout plan").replace(/exerbud\s*/i, "").trim() ||
-    "Workout plan";
+    (planTitle || "").trim() || "Workout Plan";
 
   doc
     .font("Helvetica-Bold")
     .fontSize(18)
-    .text(cleanedTitle, doc.page.margins.left + 80, currentY + 10);
+    .text(
+      cleanedTitle,
+      doc.page.margins.left + 80,
+      currentY + 10
+    );
 
   // Small gap before body
   doc.moveDown(1);
@@ -318,20 +333,29 @@ module.exports = async (req, res) => {
     }
   }
 
+  // Hard cap search context length so it doesn't explode the prompt
+  if (extraSearchContext && extraSearchContext.length > MAX_SEARCH_CONTEXT_CHARS) {
+    extraSearchContext = extraSearchContext.slice(0, MAX_SEARCH_CONTEXT_CHARS) +
+      "\n\n[Search context truncated for length]";
+  }
+
   // ---------- Convert history ----------
   const historyMessages = history
     .filter((h) => h && typeof h.content === "string")
+    .slice(-MAX_HISTORY_MESSAGES)
     .map((h) => ({
       role: h.role === "assistant" ? "assistant" : "user",
       content: h.content,
-    }));
+    ));
 
   // ---------- Attachment note + multimodal messages ----------
   let attachmentNote = "";
   const imageMessages = [];
 
-  if (attachments.length > 0) {
-    const lines = attachments.map((att, idx) => {
+  const limitedAttachments = attachments.slice(0, MAX_ATTACHMENTS);
+
+  if (limitedAttachments.length > 0) {
+    const lines = limitedAttachments.map((att, idx) => {
       const name = att?.name || `file-${idx + 1}`;
       const type = att?.type || "unknown";
       const sizeKb = att?.size ? Math.round(att.size / 1024) : null;
@@ -343,7 +367,7 @@ module.exports = async (req, res) => {
       lines.join("\n");
 
     // Build actual image messages for OpenAI (vision)
-    for (const att of attachments) {
+    for (const att of limitedAttachments) {
       if (!att || !att.data || !att.type) continue;
       const mime = att.type || "application/octet-stream";
 
@@ -396,7 +420,7 @@ module.exports = async (req, res) => {
   messages.push({ role: "user", content: lastUserContent });
 
   // ---------- MODEL SELECTION ----------
-  const modelName = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
+  const modelName = DEFAULT_MODEL;
 
   try {
     const completion = await client.chat.completions.create({
