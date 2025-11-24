@@ -9,94 +9,6 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const LOGO_URL =
-  "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudlogoblackfavicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
-
-// ---------------------------------------------------------------------------
-// Helpers for PDF export
-// ---------------------------------------------------------------------------
-function fetchImageBuffer(url) {
-  return new Promise((resolve, reject) => {
-    https
-      .get(url, (res) => {
-        if (res.statusCode !== 200) {
-          return reject(
-            new Error(`Image request failed with status ${res.statusCode}`)
-          );
-        }
-        const chunks = [];
-        res
-          .on("data", (d) => chunks.push(d))
-          .on("end", () => resolve(Buffer.concat(chunks)))
-          .on("error", reject);
-      })
-      .on("error", reject);
-  });
-}
-
-function cleanMarkdownForPdf(text) {
-  if (!text) return "";
-
-  let out = String(text);
-
-  // Remove markdown headings (### etc.)
-  out = out.replace(/^#{1,6}\s*/gm, "");
-
-  // Remove horizontal rules like --- or ___
-  out = out.replace(/^[-_]{3,}\s*$/gm, "");
-
-  // Un-bold **text**
-  out = out.replace(/\*\*(.+?)\*\*/g, "$1");
-
-  // Convert list markers "- " to bullets
-  out = out.replace(/^\s*-\s+/gm, "• ");
-
-  return out.trim();
-}
-
-async function handlePdfExport(res, body) {
-  const rawPlanText = body.planText || "";
-  const planTitle = body.planTitle || "Workout plan";
-  const cleanedPlan = cleanMarkdownForPdf(rawPlanText);
-
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader(
-    "Content-Disposition",
-    'attachment; filename="exerbud-workout-plan.pdf"'
-  );
-
-  const doc = new PDFDocument({ size: "LETTER", margin: 50 });
-  doc.pipe(res);
-
-  // Try to add logo (non-fatal if it fails)
-  try {
-    const buffer = await fetchImageBuffer(LOGO_URL);
-    doc.image(buffer, 50, 40, { width: 60 });
-    doc.moveDown(3);
-  } catch (e) {
-    doc.moveDown(1.5);
-  }
-
-  // Title
-  doc.fontSize(20).text("Exerbud", { align: "left" });
-  doc.moveDown(0.5);
-  doc
-    .fontSize(14)
-    .font("Helvetica-Bold")
-    .text(planTitle, { align: "left" });
-  doc.moveDown(1);
-
-  // Body text
-  doc.font("Helvetica").fontSize(12);
-  doc.text(cleanedPlan, {
-    align: "left",
-    lineGap: 4,
-    paragraphGap: 8,
-  });
-
-  doc.end();
-}
-
 // ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
@@ -158,6 +70,100 @@ function shouldUseSearch(message) {
 }
 
 // ---------------------------------------------------------------------------
+// PDF helpers
+// ---------------------------------------------------------------------------
+
+const EXERBUD_LOGO_URL =
+  "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudlogoblackfavicon_6093c857-65ce-4c64-8292-0597a6c6cf17.png?v=1763185899";
+
+function fetchImageBuffer(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        const chunks = [];
+        res
+          .on("data", (d) => chunks.push(d))
+          .on("end", () => resolve(Buffer.concat(chunks)))
+          .on("error", reject);
+      })
+      .on("error", reject);
+  });
+}
+
+/**
+ * Generate a nicely formatted PDF for the workout plan.
+ * - Logo only (no "Exerbud" word under it)
+ * - Title line without repeating the brand
+ * - Tight, consistent spacing between paragraphs
+ */
+async function generatePlanPdf(planText, planTitle) {
+  const doc = new PDFDocument({
+    size: "LETTER",
+    margins: { top: 64, bottom: 64, left: 64, right: 64 },
+  });
+
+  const buffers = [];
+  doc.on("data", (b) => buffers.push(b));
+
+  const pdfPromise = new Promise((resolve, reject) => {
+    doc.on("end", () => resolve(Buffer.concat(buffers)));
+    doc.on("error", reject);
+  });
+
+  // --- Header with logo + title ---
+  let currentY = doc.page.margins.top;
+
+  try {
+    const logoBuffer = await fetchImageBuffer(EXERBUD_LOGO_URL);
+    // Logo only, no text under it
+    doc.image(logoBuffer, doc.page.margins.left, currentY - 20, { width: 60 });
+  } catch (e) {
+    // If logo fails, just skip it silently
+    console.error("Logo fetch failed (non-fatal):", e.message || e);
+  }
+
+  // Title to the right of / below the logo
+  const cleanedTitle =
+    (planTitle || "Workout plan").replace(/exerbud\s*/i, "").trim() ||
+    "Workout plan";
+
+  doc
+    .font("Helvetica-Bold")
+    .fontSize(18)
+    .text(cleanedTitle, doc.page.margins.left, currentY + 40);
+
+  // Small gap before body
+  doc.moveDown(1);
+
+  // --- Body text: split into paragraphs by blank lines, use modest gaps ---
+  doc.font("Helvetica").fontSize(11);
+
+  const availableWidth =
+    doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+  const paragraphs = (planText || "")
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  paragraphs.forEach((para, idx) => {
+    doc.text(para, {
+      width: availableWidth,
+      align: "left",
+      lineGap: 3, // line spacing inside paragraph
+    });
+
+    // Smaller paragraph gap so there isn't huge white space
+    if (idx !== paragraphs.length - 1) {
+      doc.moveDown(0.7);
+    }
+  });
+
+  doc.end();
+  return pdfPromise;
+}
+
+// ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 module.exports = async (req, res) => {
@@ -190,17 +196,32 @@ module.exports = async (req, res) => {
       .json({ error: "Request body must be a JSON object" });
   }
 
-  // ---------- PDF export mode ----------
+  // ---------- Dedicated PDF export mode ----------
   if (body.pdfExport) {
+    const planText = body.planText || "";
+    const planTitle = body.planTitle || "Exerbud workout plan";
+
     try {
-      await handlePdfExport(res, body);
-      return; // important: do not fall through to OpenAI call
+      const pdfBuffer = await generatePlanPdf(planText, planTitle);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="exerbud-workout-plan.pdf"'
+      );
+      return res.status(200).send(pdfBuffer);
     } catch (err) {
-      console.error("PDF export failed:", err);
-      return res.status(500).json({ error: "Failed to generate PDF." });
+      console.error("PDF generation error:", err);
+      return res.status(500).json({
+        error: "Failed to generate PDF.",
+        details:
+          process.env.NODE_ENV === "development"
+            ? err.message || String(err)
+            : undefined,
+      });
     }
   }
 
+  // ---------- Normal chat flow ----------
   const userMessage = (body.message || "").trim();
   const history = Array.isArray(body.history) ? body.history : [];
   const attachments = Array.isArray(body.attachments) ? body.attachments : [];
