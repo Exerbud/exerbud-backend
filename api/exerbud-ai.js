@@ -26,7 +26,7 @@ You can:
 - Suggest sustainable programming (not extreme).
 - Help with exercise selection, sets/reps, weekly splits, progression, deloads.
 - Interpret descriptions of gym equipment, constraints, and schedules.
-- When the user uploads photos or screenshots (e.g., form videos, progress pics, equipment photos), you can visually inspect them and describe what you see to help with form cues and practical advice.
+- Visually analyze user-uploaded photos (form, equipment, gym layout, etc.) to give practical feedback.
 - With help from the Exerbud app, export the latest workout plan as a downloadable PDF whenever the user asks (e.g., "export this as a PDF", "turn this into a PDF").
 
 Limits & safety:
@@ -92,29 +92,56 @@ function fetchImageBuffer(url) {
 }
 
 /**
- * Light cleanup for plan text going into PDF:
- * - remove markdown headings (#, ##, ###)
- * - remove horizontal rules (---)
- * - collapse big runs of blank lines
+ * Lightly normalize markdown-ish workout text for PDF:
+ * - Remove leading # / ## / ### etc.
+ * - Turn "- something" into "• something".
+ * - Drop '---' separators.
+ * - Collapse big blank blocks.
  */
-function normalizePlanText(raw) {
+function normalizePlanTextForPdf(raw) {
   if (!raw) return "";
 
-  let text = String(raw);
+  const lines = raw.split(/\r?\n/);
+  const out = [];
+  let lastBlank = false;
 
-  // Normalise newlines
-  text = text.replace(/\r\n/g, "\n");
+  for (let line of lines) {
+    let trimmed = line.trim();
 
-  // Strip markdown headings at start of line
-  text = text.replace(/^#{1,6}\s*/gm, "");
+    // Blank / horizontal rule
+    if (!trimmed || /^-{3,}$/.test(trimmed)) {
+      if (!lastBlank) {
+        out.push("");
+        lastBlank = true;
+      }
+      continue;
+    }
 
-  // Remove lines that are just --- or similar
-  text = text.replace(/^-{3,}\s*$/gm, "");
+    // Markdown headings: #, ##, ###...
+    const headingMatch = trimmed.match(/^#{1,6}\s*(.+)$/);
+    if (headingMatch) {
+      const heading = headingMatch[1].trim();
+      // Ensure a blank line before a heading (except at very top)
+      if (!lastBlank && out.length) out.push("");
+      out.push(heading);
+      out.push("");
+      lastBlank = true;
+      continue;
+    }
 
-  // Collapse 3+ blank lines -> 2
-  text = text.replace(/\n{3,}/g, "\n\n");
+    // Bullet lines: "- text", "-- text", etc.
+    const bulletMatch = trimmed.match(/^-+\s*(.+)$/);
+    if (bulletMatch) {
+      out.push("• " + bulletMatch[1].trim());
+      lastBlank = false;
+      continue;
+    }
 
-  return text.trim();
+    out.push(trimmed);
+    lastBlank = false;
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /**
@@ -157,18 +184,20 @@ async function generatePlanPdf(planText, planTitle) {
   doc
     .font("Helvetica-Bold")
     .fontSize(18)
-    .text(cleanedTitle, doc.page.margins.left, currentY + 40);
+    .text(cleanedTitle, doc.page.margins.left + 80, currentY + 10);
 
   // Small gap before body
   doc.moveDown(1);
 
-  // --- Body text: split into paragraphs by blank lines, use modest gaps ---
+  // --- Body text: normalized from markdown-ish to plain text ---
+  const normalizedText = normalizePlanTextForPdf(planText || "");
+
   doc.font("Helvetica").fontSize(11);
 
   const availableWidth =
     doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-  const paragraphs = normalizePlanText(planText)
+  const paragraphs = (normalizedText || "")
     .split(/\n{2,}/)
     .map((p) => p.trim())
     .filter(Boolean);
@@ -257,19 +286,6 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
-  // Split attachments into images vs everything else
-  const imageAttachments = attachments.filter(
-    (att) =>
-      att &&
-      typeof att === "object" &&
-      /^image\//.test(att.type || "") &&
-      att.data
-  );
-
-  const nonImageAttachments = attachments.filter(
-    (att) => !imageAttachments.includes(att)
-  );
-
   // ---------- Convert history ----------
   const historyMessages = history
     .filter((h) => h && typeof h.content === "string")
@@ -278,8 +294,10 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
-  // ---------- Attachment note ----------
+  // ---------- Attachment note + multimodal messages ----------
   let attachmentNote = "";
+  const imageMessages = [];
+
   if (attachments.length > 0) {
     const lines = attachments.map((att, idx) => {
       const name = att?.name || `file-${idx + 1}`;
@@ -289,37 +307,42 @@ module.exports = async (req, res) => {
     });
 
     attachmentNote =
-      "The user also uploaded these files. If any are images, you can visually inspect them to give more concrete, practical feedback:\n" +
+      "The user also uploaded these files; use them as extra context. For images, you can visually inspect them:\n" +
       lines.join("\n");
-  }
 
-  // ---------- Web Search ----------
-  let extraSearchContext = "";
-  if (shouldUseSearch(userMessage)) {
-    try {
-      const results = await webSearch(userMessage);
+    // Build actual image messages for OpenAI (vision)
+    for (const att of attachments) {
+      if (!att || !att.data || !att.type) continue;
+      const mime = att.type || "application/octet-stream";
 
-      if (Array.isArray(results) && results.length > 0) {
-        extraSearchContext =
-          "Recent web search results:\n\n" +
-          results
-            .map(
-              (r, i) =>
-                `${i + 1}. ${r.title}\n${r.url}\n${r.snippet || ""}`.trim()
-            )
-            .join("\n\n");
-      } else {
-        extraSearchContext =
-          "Note: A live web search was performed for this query but did not return useful results.";
+      if (!mime.startsWith("image/")) {
+        // Non-image attachments are only mentioned in the note above for now.
+        continue;
       }
-    } catch (err) {
-      console.error("Web search failed:", err);
-      extraSearchContext =
-        "Note: A live web search was attempted but failed. Answer based on general knowledge instead.";
+
+      const imageUrl = `data:${mime};base64,${att.data}`;
+
+      imageMessages.push({
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              `User uploaded an image (${att.name || "image"}). ` +
+              `Visually inspect it and use it as context for your reply.`,
+          },
+          {
+            type: "image_url",
+            image_url: { url: imageUrl },
+          },
+        ],
+      });
     }
   }
 
-  const systemPrompt = buildExerbudSystemPrompt(extraSearchContext);
+  const systemPrompt = buildExerbudSystemPrompt(
+    body.extraSearchContext || undefined
+  );
 
   // ---------- Build messages ----------
   const messages = [{ role: "system", content: systemPrompt }, ...historyMessages];
@@ -328,36 +351,14 @@ module.exports = async (req, res) => {
     messages.push({ role: "system", content: attachmentNote });
   }
 
-  // Build user content: text + any images
-  const userContent = [];
-
-  if (userMessage) {
-    userContent.push({
-      type: "text",
-      text: userMessage,
-    });
+  // Image messages (if any) come before the latest user text
+  if (imageMessages.length > 0) {
+    messages.push(...imageMessages);
   }
 
-  // For each image attachment, send as an input_image with data URL
-  imageAttachments.forEach((att) => {
-    const mime = att.type || "image/png";
-    const base64 = att.data; // from frontend: raw base64, no prefix
-    if (!base64) return;
-
-    userContent.push({
-      type: "input_image",
-      image_url: {
-        // The hosting layer (or OpenAI) will accept data URLs directly
-        url: `data:${mime};base64,${base64}`,
-      },
-    });
-  });
-
-  // If for some reason there are no images, we still have text content
-  messages.push({ role: "user", content: userContent });
+  messages.push({ role: "user", content: userMessage });
 
   // ---------- MODEL SELECTION ----------
-  // gpt-4.1-mini is multimodal and can see images
   const modelName = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
 
   try {
