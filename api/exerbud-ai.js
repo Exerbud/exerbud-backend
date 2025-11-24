@@ -72,6 +72,19 @@ function shouldUseSearch(message) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: strip markdown links so frontend auto-linker doesn't double them
+// ---------------------------------------------------------------------------
+function stripMarkdownLinks(text) {
+  if (!text || typeof text !== "string") return text;
+
+  // Replace [label](https://url...) with just the URL
+  return text.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)[^)]*\)/g,
+    "$2"
+  );
+}
+
+// ---------------------------------------------------------------------------
 // PDF helpers
 // ---------------------------------------------------------------------------
 
@@ -399,9 +412,12 @@ module.exports = async (req, res) => {
       max_tokens: 900,
     });
 
-    const reply =
+    const rawReply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "I’m not sure what to say yet — try again with more detail.";
+
+    // Strip markdown links so the frontend auto-linker doesn't double them
+    const reply = stripMarkdownLinks(rawReply);
 
     return res.status(200).json({ reply });
   } catch (err) {
