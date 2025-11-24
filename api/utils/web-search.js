@@ -2,27 +2,30 @@
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const GOOGLE_CX = process.env.GOOGLE_CX;
-// You can use a separate Static Maps key, or reuse GOOGLE_API_KEY
-const GOOGLE_STATIC_MAPS_KEY = process.env.GOOGLE_STATIC_MAPS_KEY || GOOGLE_API_KEY;
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY; // for static map thumbnails
 
 /**
- * Build a Google Static Maps URL for a given place query.
- * This is just a simple center+marker map preview.
+ * Build a Google Static Maps URL for a given place/query.
+ * Returns null if GOOGLE_MAPS_API_KEY is not set.
  */
-function buildStaticMapUrl(query) {
-  if (!GOOGLE_STATIC_MAPS_KEY) return null;
-  if (!query) return null;
+function buildStaticMapUrl(placeTitle, originalQuery) {
+  if (!GOOGLE_MAPS_API_KEY) return null;
 
-  const params = new URLSearchParams({
-    center: query,
-    zoom: "14",
-    size: "600x400",
-    scale: "2",
-    markers: `color:red|${query}`,
-    key: GOOGLE_STATIC_MAPS_KEY,
-  });
+  const base = "https://maps.googleapis.com/maps/api/staticmap";
 
-  return `https://maps.googleapis.com/maps/api/staticmap?${params.toString()}`;
+  // Use the place title + user query as a loose location string.
+  // Example: "CrossFit Buffalo buffalo 14216"
+  const centerText = `${placeTitle || ""} ${originalQuery || ""}`.trim();
+  if (!centerText) return null;
+
+  const center = encodeURIComponent(centerText);
+  const size = "320x200"; // px
+  const zoom = "14";
+
+  // Simple marker at the same location
+  const markers = `color:red|${center}`;
+
+  return `${base}?center=${center}&zoom=${zoom}&size=${size}&markers=${markers}&key=${GOOGLE_MAPS_API_KEY}`;
 }
 
 /**
@@ -63,11 +66,10 @@ async function webSearch(query) {
 
     return data.items.map((item) => {
       const title = item.title || "";
-      const link = item.link;
+      const link = item.link || "";
       const snippet = item.snippet || "";
 
-      // For the static map, we just use the title as the query
-      const mapImageUrl = buildStaticMapUrl(title);
+      const mapImageUrl = buildStaticMapUrl(title, query);
 
       return {
         title,
