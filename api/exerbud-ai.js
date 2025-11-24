@@ -50,7 +50,8 @@ Output style:
     "\n\n" +
     "Additional live context from a recent web search (treat as external info, not absolute truth):\n" +
     extraContext +
-    "\n\nWhen you reference specific places or facts from this block, make it clear you're basing it on recent web search results, not your own memory."
+    "\n\nWhen you reference specific places or facts from this block, make it clear you're basing it on recent web search results, not your own memory. " +
+    "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results."
   );
 }
 
@@ -286,6 +287,38 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
+  // ---------- Optional web search ----------
+  // Frontend sends enableSearch: true; allow backend override by setting it false.
+  const searchEnabled = body.enableSearch !== false;
+  let extraSearchContext = "";
+
+  // Allow client to send any existing extraSearchContext if desired
+  if (body.extraSearchContext) {
+    try {
+      extraSearchContext = String(body.extraSearchContext);
+    } catch {
+      extraSearchContext = "";
+    }
+  }
+
+  if (searchEnabled && shouldUseSearch(userMessage)) {
+    try {
+      const searchResults = await webSearch(userMessage);
+
+      if (Array.isArray(searchResults) && searchResults.length > 0) {
+        const trimmed = searchResults.slice(0, 5);
+        const serialized = JSON.stringify(trimmed, null, 2);
+
+        extraSearchContext = extraSearchContext
+          ? extraSearchContext + "\n\n" + serialized
+          : serialized;
+      }
+    } catch (err) {
+      console.error("Web search failed:", err);
+      // Fail silently; the assistant can still answer without search context.
+    }
+  }
+
   // ---------- Convert history ----------
   const historyMessages = history
     .filter((h) => h && typeof h.content === "string")
@@ -341,7 +374,7 @@ module.exports = async (req, res) => {
   }
 
   const systemPrompt = buildExerbudSystemPrompt(
-    body.extraSearchContext || undefined
+    extraSearchContext || undefined
   );
 
   // ---------- Build messages ----------
