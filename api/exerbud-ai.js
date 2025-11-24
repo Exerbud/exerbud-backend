@@ -42,16 +42,6 @@ Output style:
 - Whenever you provide a full, structured workout plan (multi-day program or detailed template), end with a short line such as:
   "If you’d like, I can also turn this into a downloadable PDF — just say something like “export this as a PDF.”"
 - When you share websites or links, ALWAYS write them as plain URLs like "https://example.com" with no Markdown link formatting. Do NOT use [text](url) syntax; just include the bare URL in the text.
-- When you recommend specific gyms, studios, or trainers based on web search results, for each one output a small block in this exact format:
-
-  [[PLACE_CARD]]
-  name: <name>
-  website: <plain https URL to their main site>
-  map_image_url: <the mapImageUrl field from the web search results, if present; otherwise leave blank>
-  notes: <short bullets or sentences about why this is a good fit>
-  [[/PLACE_CARD]]
-
-  After the cards, you can also give normal prose and extra tips. Do NOT use Markdown links inside the card; use plain URLs.
 `.trim();
 
   if (!extraContext) return base;
@@ -62,8 +52,7 @@ Output style:
     "Additional live context from a recent web search (treat as external info, not absolute truth):\n" +
     extraContext +
     "\n\nWhen you reference specific places or facts from this block, make it clear you're basing it on recent web search results, not your own memory. " +
-    "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results. " +
-    "If any result includes a 'mapImageUrl' field, you should copy that value into the 'map_image_url' field inside your [[PLACE_CARD]] block for that place."
+    "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results."
   );
 }
 
