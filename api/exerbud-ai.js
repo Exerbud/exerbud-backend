@@ -12,6 +12,46 @@ const MAX_HISTORY_MESSAGES = 20;
 const MAX_SEARCH_CONTEXT_CHARS = 8000;
 const MAX_ATTACHMENTS = 8;
 
+// Coach profiles
+const COACH_PROFILES = {
+  strength: {
+    name: "Strength Coach",
+    style: `
+You specialize in strength and performance.
+- Focus on progressive overload, compound lifts, and sound technique.
+- Prefer clear, direct programming with sets, reps, RPE/effort guidance, and rest times.
+- Emphasize tracking progress over time and realistic expectations for load increases.
+`.trim()
+  },
+  hypertrophy: {
+    name: "Hypertrophy Coach",
+    style: `
+You specialize in muscle growth and aesthetics.
+- Emphasize adequate weekly volume per muscle group, controlled tempo, and mind–muscle connection.
+- Use techniques like supersets, straight sets, and higher rep ranges where appropriate.
+- Care about symmetry and balanced development, not just chasing max weight.
+`.trim()
+  },
+  mobility: {
+    name: "Mobility Specialist",
+    style: `
+You specialize in mobility, flexibility, and joint health.
+- Focus on controlled range of motion, breathing, and posture.
+- Include warm-up, cooldown, and simple daily movement habits.
+- Prioritize pain-free movement and regressions over forcing range of motion.
+`.trim()
+  },
+  fat_loss: {
+    name: "Fat Loss Coach",
+    style: `
+You specialize in safe, sustainable fat loss.
+- Focus on energy expenditure, consistency, and building habits that are actually doable.
+- Use circuits, step targets, and time-efficient sessions when needed.
+- Emphasize mindset, adherence, and realistic timeframes rather than crash approaches.
+`.trim()
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Lazy OpenAI client (works with ESM-only openai@4 in CJS)
 // ---------------------------------------------------------------------------
@@ -23,8 +63,13 @@ async function getOpenAIClient() {
 // ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
-function buildExerbudSystemPrompt(extraContext) {
-  const base = `
+function buildExerbudSystemPrompt(extraContext, coachProfileKey) {
+  const coach =
+    coachProfileKey && COACH_PROFILES[coachProfileKey]
+      ? COACH_PROFILES[coachProfileKey]
+      : null;
+
+  let base = `
 You are Exerbud — a realistic, no-bullshit strength and conditioning coach.
 
 Tone:
@@ -38,7 +83,7 @@ You can:
 - Help with exercise selection, sets/reps, weekly splits, progression, deloads.
 - Interpret descriptions of gym equipment, constraints, and schedules.
 - Visually analyze user-uploaded photos (form, equipment, gym layout, etc.) to give practical feedback.
-- With help from the Exerbud app, export the latest workout plan as a downloadable PDF whenever the user asks (e.g., "export this as a PDF", "turn this into a PDF").
+- With help from the Exerbud app, export the latest workout plan as a downloadable PDF whenever the user asks.
 
 Limits & safety:
 - Do NOT diagnose injuries or medical issues and never prescribe drugs.
@@ -53,6 +98,20 @@ Output style:
 - Whenever you provide a full, structured workout plan (multi-day program or detailed template), end with a short line such as:
   "If you’d like, I can also turn this into a downloadable PDF — just say something like “export this as a PDF.”"
 `.trim();
+
+  if (coach) {
+    base += `
+
+You are currently operating as a ${coach.name}.
+Adopt this coaching style:
+${coach.style}
+`;
+  } else {
+    base += `
+
+If the user hasn't explicitly chosen a coach profile, use a balanced generalist style that blends strength, hypertrophy, and overall health.
+`;
+  }
 
   if (!extraContext) return base;
 
@@ -295,6 +354,9 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message' in body" });
   }
 
+  const coachProfile =
+    typeof body.coachProfile === "string" ? body.coachProfile : null;
+
   // Optional web search
   const searchEnabled = body.enableSearch !== false;
   let extraSearchContext = "";
@@ -381,7 +443,8 @@ module.exports = async (req, res) => {
   }
 
   const systemPrompt = buildExerbudSystemPrompt(
-    extraSearchContext || undefined
+    extraSearchContext || undefined,
+    coachProfile
   );
 
   const messages = [{ role: "system", content: systemPrompt }, ...historyMessages];
