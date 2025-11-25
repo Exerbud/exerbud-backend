@@ -1,12 +1,32 @@
 // api/exerbud-ai-stream.js
 //
-// Exerbud AI – SSE Streaming Endpoint
-// -------------------------------------
-// Produces REAL streaming responses using Server-Sent Events (SSE).
-// Mirrors the logic of /api/exerbud-ai.js, but returns tokens as they arrive.
+// Exerbud AI – SSE Streaming Endpoint (Vision 2.0 + Weekly Planner + Coach Profiles)
+//
+// Frontend sends POST JSON:
+// {
+//   message: "<user_text>",
+//   history: [...],
+//   attachments: [...],
+//   enableSearch: true/false,
+//   coachProfile: "strength" | "hypertrophy" | "mobility" | "fat_loss" | null
+// }
+//
+// This endpoint returns Server-Sent Events (SSE) with tokens:
+//   data: <token>\n\n
+// and finishes with:
+//   data: [DONE]\n\n
 //
 
 const { webSearch } = require("./utils/web-search");
+
+// ---------------------------------------------------------------------------
+// Disable default body parsing so we can read raw body (required for SSE)
+// ---------------------------------------------------------------------------
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -34,7 +54,7 @@ You specialize in strength and performance.
     style: `
 You specialize in muscle growth and aesthetics.
 - Emphasize adequate weekly volume per muscle group, controlled tempo, and mind–muscle connection.
-- Use techniques like supersets, straight sets, and higher rep ranges where appropriate.
+- Use techniques like straight sets, supersets, and moderate-to-high rep ranges where appropriate.
 - Care about symmetry and balanced development, not just chasing max weight.
 `.trim(),
   },
@@ -59,7 +79,7 @@ You specialize in safe, sustainable fat loss.
 };
 
 // ---------------------------------------------------------------------------
-// Lazy-load OpenAI client
+// Lazy-load OpenAI client (ESM package)
 // ---------------------------------------------------------------------------
 async function getOpenAIClient() {
   const OpenAI = (await import("openai")).default;
@@ -69,7 +89,21 @@ async function getOpenAIClient() {
 }
 
 // ---------------------------------------------------------------------------
-// Build System Prompt
+// Raw body reader for Vercel
+// ---------------------------------------------------------------------------
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", (err) => reject(err));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// System prompt builder
 // ---------------------------------------------------------------------------
 function buildExerbudSystemPrompt(extraContext, coachProfileKey) {
   const coach =
@@ -106,7 +140,7 @@ Output style:
 - Start with 1–2 sentences reflecting what you understood.
 - Then give structured guidance with headings and bullet points.
 - End with 2–4 clear "Next steps" so the user knows exactly what to do.
-- Whenever you provide a full, structured workout plan, end with:
+- Whenever you provide a full, structured workout plan (multi-day program or detailed template), end with a short line such as:
   "If you’d like, I can also turn this into a downloadable PDF — just say something like “export this as a PDF.”"
 `.trim();
 
@@ -120,7 +154,7 @@ ${coach.style}
   } else {
     base += `
 
-If the user hasn't chosen a coach profile, use a balanced generalist style.
+If the user hasn't explicitly chosen a coach profile, use a balanced generalist style that blends strength, hypertrophy, and overall health.
 `;
   }
 
@@ -128,14 +162,16 @@ If the user hasn't chosen a coach profile, use a balanced generalist style.
 
   return (
     base +
-    "\n\nAdditional live web context:\n" +
+    "\n\n" +
+    "Additional live context from a recent web search (treat as external info, not absolute truth):\n" +
     extraContext +
-    "\n\n(Reference this info as coming from live search, not memory.)"
+    "\n\nWhen you reference specific places or facts from this block, make it clear you are basing it on recent web search results, not your own memory. " +
+    "Because this block exists, do NOT say you can't browse the internet—instead, say you looked this up via recent web results."
   );
 }
 
 // ---------------------------------------------------------------------------
-// Should we run web search?
+// Heuristics: search & weekly planner
 // ---------------------------------------------------------------------------
 function shouldUseSearch(message) {
   if (!message) return false;
@@ -149,9 +185,6 @@ function shouldUseSearch(message) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Weekly planner intent detection
-// ---------------------------------------------------------------------------
 function isWeeklyPlannerRequest(message) {
   if (!message) return false;
   const lower = message.toLowerCase();
@@ -174,7 +207,7 @@ function isWeeklyPlannerRequest(message) {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic User Profile Summary
+// Lightweight “user profile” summary from history
 // ---------------------------------------------------------------------------
 async function buildUserProfileSummary(client, historyMessages) {
   if (!historyMessages || historyMessages.length === 0) return null;
@@ -229,10 +262,22 @@ Output format:
 }
 
 // ---------------------------------------------------------------------------
-// SSE streaming endpoint
+// SSE helpers
+// ---------------------------------------------------------------------------
+function writeSSEChunk(res, token) {
+  res.write(`data: ${token}\n\n`);
+}
+
+function endSSE(res) {
+  res.write(`data: [DONE]\n\n`);
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
+// Main handler
 // ---------------------------------------------------------------------------
 module.exports = async (req, res) => {
-  // CORS
+  // Basic CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -244,14 +289,21 @@ module.exports = async (req, res) => {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // Parse body
-  let body = req.body;
-  if (typeof body === "string") {
-    try {
-      body = JSON.parse(body);
-    } catch (err) {
-      return res.status(400).json({ error: "Invalid JSON" });
-    }
+  // ------------------- Parse JSON body safely -------------------
+  let raw;
+  try {
+    raw = await getRawBody(req);
+  } catch (err) {
+    console.error("Error reading raw body:", err);
+    return res.status(400).json({ error: "Could not read request body" });
+  }
+
+  let body;
+  try {
+    body = JSON.parse(raw || "{}");
+  } catch (err) {
+    console.error("JSON parse error (stream):", err);
+    return res.status(400).json({ error: "Invalid JSON" });
   }
 
   const userMessage = (body.message || "").trim();
@@ -266,9 +318,7 @@ module.exports = async (req, res) => {
 
   const weeklyPlannerRequested = isWeeklyPlannerRequest(userMessage);
 
-  // -------------------------------------------------------------------------
-  // Web Search (safe – wrapped in its own try/catch)
-  // -------------------------------------------------------------------------
+  // ------------------- Optional web search -------------------
   let extraSearchContext = "";
   if (body.enableSearch !== false && shouldUseSearch(userMessage)) {
     try {
@@ -283,22 +333,22 @@ module.exports = async (req, res) => {
     }
   }
 
-  // History (text only) for context
+  // ------------------- History prep -------------------
   const historyMessages = history
-    .filter((h) => h?.content)
+    .filter((h) => h && h.content)
     .slice(-MAX_HISTORY_MESSAGES)
     .map((h) => ({
       role: h.role === "assistant" ? "assistant" : "user",
       content: h.content,
     }));
 
-  // Attachments: Vision 2.0 + notes (pure JS, no network)
+  // ------------------- Attachment processing -------------------
   const visionImages = [];
   const nonImageAttachmentLines = [];
-  const limited = attachments.slice(0, MAX_ATTACHMENTS);
+  const limitedAttachments = attachments.slice(0, MAX_ATTACHMENTS);
 
-  for (let i = 0; i < limited.length; i++) {
-    const att = limited[i];
+  for (let i = 0; i < limitedAttachments.length; i++) {
+    const att = limitedAttachments[i];
     if (!att) continue;
 
     const name = att.name || `file-${i + 1}`;
@@ -356,31 +406,17 @@ module.exports = async (req, res) => {
     userMessage ||
     "The user sent attachments without text. Use them for your reply.";
 
-  // -------------------------------------------------------------------------
-  // Start SSE Response NOW so any later errors don't become HTTP 500
-  // -------------------------------------------------------------------------
+  // ------------------- Start SSE response -------------------
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
   });
 
-  function sendChunk(token) {
-    res.write(`data: ${token}\n\n`);
-  }
-
-  function endStream() {
-    res.write(`data: [DONE]\n\n`);
-    res.end();
-  }
-
-  // -------------------------------------------------------------------------
-  // OpenAI Streaming (everything risky is inside this try/catch)
-  // -------------------------------------------------------------------------
+  // ------------------- OpenAI streaming inside try/catch -------------------
   try {
     const client = await getOpenAIClient();
 
-    // User profile summary (memory-lite)
     const userProfileSummary = await buildUserProfileSummary(
       client,
       historyMessages
@@ -444,15 +480,19 @@ When this is true, you MUST:
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta;
       if (!delta) continue;
-
       const token = delta.content || "";
-      if (token) sendChunk(token);
+      if (token) {
+        writeSSEChunk(res, token);
+      }
     }
 
-    endStream();
+    endSSE(res);
   } catch (err) {
     console.error("Streaming error:", err);
-    sendChunk("⚠️ Streaming error occurred.");
-    endStream();
+    writeSSEChunk(
+      res,
+      "⚠️ Something went wrong while generating this reply. Please try again in a moment."
+    );
+    endSSE(res);
   }
 };
