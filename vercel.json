@@ -5,6 +5,8 @@
   ],
   "routes": [
     { "src": "/api/exerbud-ai", "dest": "/api/exerbud-ai.js" },
+    { "src": "/api/exerbud-ai-stream", "dest": "/api/exerbud-ai-stream.js" },
+
     { "src": "/api/lannaex-ai", "dest": "/api/lannaex-ai.js" },
     { "src": "/api/lannaex-business-ai", "dest": "/api/lannaex-business-ai.js" },
     { "src": "/api/lannaex-fashion-ai", "dest": "/api/lannaex-fashion-ai.js" },
