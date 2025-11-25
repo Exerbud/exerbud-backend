@@ -1,406 +1,196 @@
-// api/exerbud-ai.js
+// ======================================================================
+// EXERBUD AI — NON-STREAMING BACKEND WITH GOOGLE SEARCH + PDF EXPORT
+// ======================================================================
+
+const fetch = require("node-fetch");
 
 // ----------------------------------------------
-// Imports & config
-// ----------------------------------------------
-const PDFDocument = require("pdfkit");
-
-// Lazy-load OpenAI so Vercel cold starts are nicer
-let cachedOpenAI = null;
-async function getOpenAIClient() {
-  if (!cachedOpenAI) {
-    const OpenAI = (await import("openai")).default;
-    cachedOpenAI = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-  }
-  return cachedOpenAI;
-}
-
-const MODEL = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
-const MAX_HISTORY_MESSAGES = 20;
-const MAX_ATTACHMENTS = 4;
-const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024; // 8 MB per file
-
-// ----------------------------------------------
-// Helper: simple Google CSE web search
-// ----------------------------------------------
-async function runWebSearch(query) {
-  try {
-    const apiKey = process.env.GOOGLE_API_KEY;
-    const cx = process.env.GOOGLE_CX;
-
-    if (!apiKey || !cx || !query) return null;
-
-    const url =
-      "https://www.googleapis.com/customsearch/v1" +
-      `?key=${encodeURIComponent(apiKey)}` +
-      `&cx=${encodeURIComponent(cx)}` +
-      `&q=${encodeURIComponent(query)}`;
-
-    const res = await fetch(url);
-    if (!res.ok) {
-      console.error("Google CSE error status:", res.status);
-      return null;
-    }
-
-    const data = await res.json();
-    if (!data.items || !Array.isArray(data.items)) return null;
-
-    const top = data.items.slice(0, 5);
-    const lines = top.map((item, idx) => {
-      const title = item.title || "";
-      const snippet = item.snippet || "";
-      const link = item.link || "";
-      return `${idx + 1}. ${title}\n${snippet}\n${link}`;
-    });
-
-    return lines.join("\n\n");
-  } catch (err) {
-    console.error("runWebSearch error:", err);
-    return null;
-  }
-}
-
-// ----------------------------------------------
-// Helper: coach profiles
-// ----------------------------------------------
-function getCoachProfileText(coachProfile) {
-  switch (coachProfile) {
-    case "strength":
-      return `
-You are acting as a Strength Coach.
-
-- Prioritize progressive overload, compound lifts, and clear weekly structure.
-- Use clear set/rep schemes (e.g., 3x5, 4x6–8) with effort guidance (RPE or "2 reps in reserve").
-- Emphasize technique quality and long-term joint health.
-- Plans should feel realistic and not crazy high volume.
-`.trim();
-
-    case "hypertrophy":
-      return `
-You are acting as a Hypertrophy Coach.
-
-- Focus on muscle growth and aesthetics.
-- Use moderate to higher rep ranges (e.g., 6–15) and adequate weekly volume per muscle.
-- Emphasize controlled tempo, mind–muscle connection, and symmetrical development.
-- Use a mix of compounds and isolation work, structured logically by muscle group.
-`.trim();
-
-    case "mobility":
-      return `
-You are acting as a Mobility Specialist.
-
-- Focus on joint health, active range of motion, and long-term resilience.
-- Use dynamic mobility, loaded stretching, and controlled articular rotations where appropriate.
-- Include clear instructions for tempo, time under stretch, and breathing.
-- Emphasize pain-free ranges and gradual progress.
-`.trim();
-
-    case "fat_loss":
-      return `
-You are acting as a Fat Loss Coach.
-
-- Prioritize sustainable, realistic training to support fat loss.
-- Use a mix of resistance training and conditioning, avoiding excessive volume that hurts recovery.
-- Emphasize habits: steps, sleep, adherence, and realistic expectations.
-- Make workouts feel achievable for busy people.
-`.trim();
-
-    default:
-      return `
-You are Exerbud, a friendly but no-nonsense fitness coach.
-
-- Give clear, structured training guidance.
-- Use realistic volumes and rest periods.
-- Explain your choices briefly, but keep the plan readable.
-`.trim();
-  }
-}
-
-// ----------------------------------------------
-// Helper: main system prompt
-// ----------------------------------------------
-function buildSystemPrompt(coachProfile) {
-  const baseCoachText = getCoachProfileText(coachProfile);
-
-  return `
-You are Exerbud AI, an expert fitness coach that helps people design training plans, routines, and schedules.
-
-${baseCoachText}
-
-GENERAL BEHAVIOR:
-- Always be specific and actionable.
-- Prefer numbered or bulleted lists for exercises, sets, reps, and notes.
-- When giving workout plans, group them clearly by days (e.g., "Day 1 – Upper", "Day 2 – Lower").
-- Keep wording concise and friendly.
-- You can explain your reasoning briefly, but keep the workout itself easy to read.
-
-IMAGES:
-- If images are provided (gym photos, screenshots of routines, progress pics), describe what you see and then give practical recommendations.
-- Do NOT comment on appearance in a judgmental way. Be supportive and neutral.
-
-WEB SEARCH:
-- You may be given a block of "WEB SEARCH RESULTS" containing gym listings, trainers, or product links.
-- Use those results to make more concrete suggestions (e.g., "Gym A looks like it has good equipment for strength training because…").
-- If search results look sparse or generic, say so.
-
-WEEKLY / MULTI-WEEK PLANS:
-- When the user asks for a weekly or multi-week plan, format it clearly.
-- Use headings like "Week 1", "Week 2" when appropriate.
-- Within each week, break things down by day: "Day 1 – Upper", "Day 2 – Lower", etc.
-- Under each day, list exercises as bullet points with sets, reps, and rest times.
-
-FORMATTING:
-- Use line breaks to separate sections.
-- Use simple bullets with "-" for lists.
-- For numbered steps, use "1.", "2.", etc.
-- Avoid markdown tables; they are harder to read in plain text.
-`.trim();
-}
-
-// ----------------------------------------------
-// Helper: build OpenAI messages with history & attachments
-// ----------------------------------------------
-function buildMessages({ systemPrompt, message, history, searchContext, attachmentNote }) {
-  const messages = [
-    {
-      role: "system",
-      content: systemPrompt,
-    },
-  ];
-
-  if (Array.isArray(history)) {
-    history
-      .slice(-MAX_HISTORY_MESSAGES)
-      .forEach((m) => {
-        if (!m || !m.content) return;
-        const role = m.role === "assistant" ? "assistant" : "user";
-        messages.push({ role, content: m.content });
-      });
-  }
-
-  if (searchContext) {
-    messages.push({
-      role: "system",
-      content:
-        "WEB SEARCH RESULTS:\n\n" +
-        searchContext +
-        "\n\nUse these results if they are relevant to the user's request.",
-    });
-  }
-
-  if (attachmentNote) {
-    messages.push({
-      role: "user",
-      content: attachmentNote,
-    });
-  }
-
-  // The final user message goes last; we'll merge text + images there
-  // (for chat.completions with vision-compatible models)
-  // We return just the text here; image parts will be attached in handler.
-  messages.push({
-    role: "user",
-    content: message || "",
-  });
-
-  return messages;
-}
-
-// ----------------------------------------------
-// Helper: build image content parts for vision
-// ----------------------------------------------
-function buildImagePartsFromAttachments(attachments) {
-  if (!Array.isArray(attachments) || !attachments.length) return [];
-
-  const images = attachments.filter(
-    (file) =>
-      file &&
-      typeof file.data === "string" &&
-      file.type &&
-      file.type.startsWith("image/") &&
-      file.size <= MAX_ATTACHMENT_BYTES
-  );
-
-  if (!images.length) return [];
-
-  return images.map((file) => ({
-    type: "image_url",
-    image_url: {
-      url: `data:${file.type};base64,${file.data}`,
-    },
-  }));
-}
-
-// ----------------------------------------------
-// Helper: quick attachment summary for non-image files
-// ----------------------------------------------
-function buildAttachmentNote(attachments) {
-  if (!Array.isArray(attachments) || !attachments.length) return "";
-
-  const nonImages = attachments.filter(
-    (file) => !file.type || !file.type.startsWith("image/")
-  );
-
-  if (!nonImages.length) return "";
-
-  const lines = nonImages.map((file) => {
-    const name = file.name || "file";
-    const sizeKb = file.size ? Math.round(file.size / 1024) : "?";
-    return `- ${name} (${sizeKb} KB, type: ${file.type || "unknown"})`;
-  });
-
-  return `
-The user also attached these non-image files (you do NOT see their contents, only the metadata):
-
-${lines.join("\n")}
-
-You cannot read these files directly, but you can ask the user to paste text or describe them if needed.
-`.trim();
-}
-
-// ----------------------------------------------
-// Helper: generate a simple PDF from text
-// ----------------------------------------------
-function generatePdfFromText(res, { title, text }) {
-  const doc = new PDFDocument({ margin: 50 });
-
-  // Basic headers
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${(title || "exerbud-workout-plan")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "exerbud-workout-plan"}.pdf"`
-  );
-
-  doc.pipe(res);
-
-  doc.fontSize(18).text(title || "Exerbud workout plan", {
-    align: "left",
-  });
-
-  doc.moveDown();
-
-  const cleaned = (text || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
-  doc.fontSize(11).text(cleaned || "No plan content provided.", {
-    align: "left",
-  });
-
-  doc.end();
-}
-
-// ----------------------------------------------
-// Main handler
+// Main handler (WITH CORS FIXED)
 // ----------------------------------------------
 module.exports = async function handler(req, res) {
+  //
+  // --- GLOBAL CORS HEADERS (REQUIRED FOR SHOPIFY) ---
+  //
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Preflight request
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  // Only POST allowed for real operations
   if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
+    res.setHeader("Allow", "POST, OPTIONS");
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
     const body = req.body || {};
 
-    // 1) PDF export short-circuit
+    // ==========================================================
+    //  PDF EXPORT MODE
+    // ==========================================================
     if (body.pdfExport) {
-      const planText = body.planText || "";
-      const planTitle = body.planTitle || "Exerbud workout plan";
-      return generatePdfFromText(res, { title: planTitle, text: planText });
+      const planText = body.planText || "Your workout plan";
+      const title = body.planTitle || "Exerbud workout plan";
+
+      const PDFDocument = require("pdfkit");
+      const doc = new PDFDocument({ margin: 40 });
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${title.replace(/[^a-z0-9_\-]/gi, "_")}.pdf"`
+      );
+
+      doc.pipe(res);
+
+      doc.fontSize(20).text(title, { align: "left" });
+      doc.moveDown();
+
+      doc.fontSize(12);
+      const paragraphs = planText.split(/\n{2,}/);
+
+      paragraphs.forEach((para, index) => {
+        const clean = para.trim();
+        if (!clean) return;
+
+        doc.text(clean);
+        if (index < paragraphs.length - 1) doc.moveDown();
+      });
+
+      doc.end();
+      return;
     }
 
-    // 2) Normal chat flow
-    const message = typeof body.message === "string" ? body.message.trim() : "";
+    // ==========================================================
+    //  NORMAL CHAT REQUEST
+    // ==========================================================
+    const message = body.message || "";
     const history = Array.isArray(body.history) ? body.history : [];
     const attachments = Array.isArray(body.attachments) ? body.attachments : [];
-    const enableSearch = !!body.enableSearch;
+    const enableSearch = Boolean(body.enableSearch);
     const coachProfile = body.coachProfile || null;
 
-    if (!message && !attachments.length) {
-      return res.status(400).json({
-        error: "Missing 'message' or 'attachments' in request body.",
-      });
+    if (!message) {
+      return res.status(400).json({ error: "Missing message" });
     }
 
-    // Trim attachments count
-    const limitedAttachments = attachments.slice(0, MAX_ATTACHMENTS);
+    // Prepare conversation history
+    const formattedHistory = history.map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content || "",
+    }));
 
-    // Possibly run web search
-    let searchContext = null;
-    if (enableSearch && message) {
-      // Simple heuristic: search when user mentions "find", "near me", or "best"
-      const lower = message.toLowerCase();
-      const shouldSearch =
-        /near me|find|search|best gym|personal trainer|coach|equipment/.test(lower);
+    const messages = [...formattedHistory];
 
-      if (shouldSearch) {
-        searchContext = await runWebSearch(message);
+    // SYSTEM PROMPT
+    let systemPrompt =
+      "You are Exerbud, a helpful fitness and strength training coach. " +
+      "Give clear, practical, sustainable advice. Avoid markdown headings (#). " +
+      "Bullet points are okay. Keep formatting clean and readable.";
+
+    if (coachProfile === "strength") {
+      systemPrompt += " You focus on strength training and compound lifts.";
+    } else if (coachProfile === "hypertrophy") {
+      systemPrompt += " You focus on hypertrophy and muscle-building programming.";
+    } else if (coachProfile === "mobility") {
+      systemPrompt += " You focus on mobility, joint health, pain-free movement.";
+    } else if (coachProfile === "fat_loss") {
+      systemPrompt += " You focus on sustainable fat loss while preserving muscle.";
+    }
+
+    messages.unshift({
+      role: "system",
+      content:
+        systemPrompt +
+        " If you produce workout schedules, format them cleanly using plain text and bullet points. No markdown headers.",
+    });
+
+    // ==========================================================
+    // GOOGLE SEARCH (OPTIONAL)
+    // ==========================================================
+    let toolResultsText = "";
+
+    if (
+      enableSearch &&
+      process.env.GOOGLE_API_KEY &&
+      process.env.GOOGLE_CX
+    ) {
+      try {
+        const query = message.slice(0, 200);
+
+        const url = new URL("https://www.googleapis.com/customsearch/v1");
+        url.searchParams.set("key", process.env.GOOGLE_API_KEY);
+        url.searchParams.set("cx", process.env.GOOGLE_CX);
+        url.searchParams.set("q", query);
+
+        const searchRes = await fetch(url.toString());
+        const searchData = await searchRes.json();
+
+        if (searchData.items?.length) {
+          const snippets = searchData.items
+            .slice(0, 5)
+            .map((item, i) => {
+              const title = item.title || "";
+              const snippet = item.snippet || "";
+              const link = item.link || "";
+              return `${i + 1}. ${title}\n${snippet}\n${link}`;
+            })
+            .join("\n\n");
+
+          toolResultsText =
+            "Search results:\n\n" +
+            snippets +
+            "\n\nUse this as context, but write your answer naturally. Do not explicitly mention these results.";
+        }
+      } catch (err) {
+        console.error("Google Search Error:", err);
       }
     }
 
-    // Build system prompt
-    const systemPrompt = buildSystemPrompt(coachProfile);
-
-    // Attachment notes for non-images
-    const attachmentNote = buildAttachmentNote(limitedAttachments);
-
-    // Build messages
-    const baseMessages = buildMessages({
-      systemPrompt,
-      message,
-      history,
-      searchContext,
-      attachmentNote,
-    });
-
-    // Build vision-aware final user message
-    const imageParts = buildImagePartsFromAttachments(limitedAttachments);
-
-    let messages;
-
-    if (imageParts.length > 0) {
-      // Replace final user message with content array including text + images
-      messages = baseMessages.slice(0, -1);
-      const lastUser = baseMessages[baseMessages.length - 1];
-      messages.push({
-        role: "user",
-        content: [
-          { type: "text", text: lastUser.content || message || "" },
-          ...imageParts,
-        ],
-      });
-    } else {
-      messages = baseMessages;
+    let augmentedUserMessage = message;
+    if (toolResultsText) {
+      augmentedUserMessage =
+        message +
+        "\n\n[Search Context]\n\n" +
+        toolResultsText +
+        "\n\n(Do not mention this bracketed text explicitly.)";
     }
 
-    // Call OpenAI
-    const client = await getOpenAIClient();
-    const completion = await client.chat.completions.create({
-      model: MODEL,
-      messages,
-      temperature: 0.6,
+    messages.push({
+      role: "user",
+      content: augmentedUserMessage,
     });
 
-    const choice = completion.choices && completion.choices[0];
+    // ==========================================================
+    // OPENAI COMPLETION
+    // ==========================================================
+    const OpenAI = (await import("openai")).default;
+
+    const client = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+
+    const completion = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages,
+      temperature: 0.6,
+      max_tokens: 900,
+    });
+
     const reply =
-      (choice && choice.message && choice.message.content) ||
-      "I’m not sure what to say yet — try asking in a different way or giving more detail.";
+      completion.choices?.[0]?.message?.content ||
+      "I’m sorry — I wasn’t able to generate a response.";
 
     return res.status(200).json({ reply });
-  } catch (err) {
-    console.error("Exerbud AI backend error:", err);
+  } catch (error) {
+    console.error("Exerbud AI backend error:", error);
     return res.status(500).json({
-      error: "Exerbud backend failed.",
-      details:
-        process.env.NODE_ENV === "development"
-          ? err.message || String(err)
-          : undefined,
+      error: "Internal server error",
+      details: error?.message || "Unknown error",
     });
   }
 };
