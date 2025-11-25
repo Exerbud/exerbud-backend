@@ -1,6 +1,5 @@
 // api/exerbud-ai-stream.js
-//
-// Exerbud AI – SSE Streaming Endpoint (Vision 2.0 + Weekly Planner + Coach Profiles)
+// Exerbud Stream v1.1 – SSE + Vision 2.0 + Weekly Planner + Coach Profiles
 //
 // Frontend sends POST JSON:
 // {
@@ -496,4 +495,3 @@ When this is true, you MUST:
     endSSE(res);
   }
 };
-
