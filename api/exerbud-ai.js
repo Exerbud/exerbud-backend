@@ -148,6 +148,31 @@ function shouldUseSearch(message) {
 }
 
 // ---------------------------------------------------------------------------
+// Weekly planner intent detection
+// ---------------------------------------------------------------------------
+function isWeeklyPlannerRequest(message) {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+
+  if (
+    lower.includes("weekly routine") ||
+    lower.includes("weekly plan") ||
+    lower.includes("weekly program") ||
+    lower.includes("weekly planner") ||
+    lower.includes("week by week") ||
+    lower.includes("week-by-week")
+  ) {
+    return true;
+  }
+
+  // phrases like "4 week plan", "8-week program", etc.
+  const weekPattern = /\b([2-9]|10|12)\s*[- ]?\s*week(s)?\b/;
+  if (weekPattern.test(lower)) return true;
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // PDF helpers
 // ---------------------------------------------------------------------------
 const EXERBUD_LOGO_URL =
@@ -301,7 +326,7 @@ async function buildUserProfileSummary(client, historyMessages) {
       .join("\n\n")
       .slice(0, 8000); // safety cap
 
-    const messages = [
+  const messages = [
       {
         role: "system",
         content: `
@@ -413,6 +438,8 @@ module.exports = async (req, res) => {
 
   const coachProfile =
     typeof body.coachProfile === "string" ? body.coachProfile : null;
+
+  const weeklyPlannerRequested = isWeeklyPlannerRequest(userMessage);
 
   // Optional web search
   const searchEnabled = body.enableSearch !== false;
@@ -538,6 +565,23 @@ module.exports = async (req, res) => {
       content:
         "User profile summary based on the conversation so far (use this to keep recommendations consistent, and do NOT invent missing details):\n" +
         userProfileSummary,
+    });
+  }
+
+  if (weeklyPlannerRequested) {
+    messages.push({
+      role: "system",
+      content: `
+The user is explicitly asking for a structured weekly training plan or multi-week calendar.
+When this is true, you MUST:
+
+- Build a clear plan organized by week and day.
+- Use headings like "Week 1", "Week 2", etc.
+- Inside each week, list training days in order with labels like "Mon", "Tue", "Wed" OR "Day 1", "Day 2" depending on what makes most sense.
+- Keep the total number of weekly sessions consistent with what the user can realistically do (from their profile and messages).
+- Include brief notes on progression across weeks (load, reps, difficulty, or volume) and when to deload.
+- Keep formatting clean and simple so it can be exported to a PDF or typed into a calendar.
+`.trim()
     });
   }
 

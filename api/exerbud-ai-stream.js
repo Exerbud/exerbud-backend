@@ -69,7 +69,7 @@ async function getOpenAIClient() {
 }
 
 // ---------------------------------------------------------------------------
-// Build System Prompt (same as main endpoint, shorter web note)
+// Build System Prompt
 // ---------------------------------------------------------------------------
 function buildExerbudSystemPrompt(extraContext, coachProfileKey) {
   const coach =
@@ -149,7 +149,31 @@ function shouldUseSearch(message) {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic User Profile Summary (Option A)
+// Weekly planner intent detection
+// ---------------------------------------------------------------------------
+function isWeeklyPlannerRequest(message) {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+
+  if (
+    lower.includes("weekly routine") ||
+    lower.includes("weekly plan") ||
+    lower.includes("weekly program") ||
+    lower.includes("weekly planner") ||
+    lower.includes("week by week") ||
+    lower.includes("week-by-week")
+  ) {
+    return true;
+  }
+
+  const weekPattern = /\b([2-9]|10|12)\s*[- ]?\s*week(s)?\b/;
+  if (weekPattern.test(lower)) return true;
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Automatic User Profile Summary
 // ---------------------------------------------------------------------------
 async function buildUserProfileSummary(client, historyMessages) {
   if (!historyMessages || historyMessages.length === 0) return null;
@@ -239,6 +263,8 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "Missing 'message'." });
   }
 
+  const weeklyPlannerRequested = isWeeklyPlannerRequest(userMessage);
+
   // -------------------------------------------------------------------------
   // Web Search
   // -------------------------------------------------------------------------
@@ -274,7 +300,7 @@ module.exports = async (req, res) => {
   // ---------- Automatic User Profile Summary ----------
   const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
 
-  // ---------- Attachments: Vision 2.0 + non-image notes ----------
+  // ---------- Attachments: Vision 2.0 + notes ----------
   const visionImages = [];
   const nonImageAttachmentLines = [];
   const limited = attachments.slice(0, MAX_ATTACHMENTS);
@@ -342,6 +368,23 @@ module.exports = async (req, res) => {
       content:
         "User profile summary based on the conversation so far (use this to keep recommendations consistent, and do NOT invent missing details):\n" +
         userProfileSummary,
+    });
+  }
+
+  if (weeklyPlannerRequested) {
+    messages.push({
+      role: "system",
+      content: `
+The user is explicitly asking for a structured weekly training plan or multi-week calendar.
+When this is true, you MUST:
+
+- Build a clear plan organized by week and day.
+- Use headings like "Week 1", "Week 2", etc.
+- Inside each week, list training days in order with labels like "Mon", "Tue", "Wed" OR "Day 1", "Day 2" depending on what makes most sense.
+- Keep the total number of weekly sessions consistent with what the user can realistically do (from their profile and messages).
+- Include brief notes on progression across weeks (load, reps, difficulty, or volume) and when to deload.
+- Keep formatting clean and simple so it can be exported to a PDF or typed into a calendar.
+`.trim()
     });
   }
 
