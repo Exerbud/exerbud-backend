@@ -27,7 +27,7 @@ You specialize in strength and performance.
 - Focus on progressive overload, compound lifts, and sound technique.
 - Prefer clear, direct programming with sets, reps, RPE/effort guidance, and rest times.
 - Emphasize tracking progress over time and realistic expectations for load increases.
-`.trim()
+`.trim(),
   },
   hypertrophy: {
     name: "Hypertrophy Coach",
@@ -36,7 +36,7 @@ You specialize in muscle growth and aesthetics.
 - Emphasize adequate weekly volume per muscle group, controlled tempo, and mind–muscle connection.
 - Use techniques like supersets, straight sets, and higher rep ranges where appropriate.
 - Care about symmetry and balanced development, not just chasing max weight.
-`.trim()
+`.trim(),
   },
   mobility: {
     name: "Mobility Specialist",
@@ -45,7 +45,7 @@ You specialize in mobility, flexibility, and joint health.
 - Focus on controlled range of motion, breathing, and posture.
 - Include warm-up, cooldown, and simple daily movement habits.
 - Prioritize pain-free movement and regressions over forcing range of motion.
-`.trim()
+`.trim(),
   },
   fat_loss: {
     name: "Fat Loss Coach",
@@ -54,8 +54,8 @@ You specialize in safe, sustainable fat loss.
 - Focus on energy expenditure, consistency, and building habits that are actually doable.
 - Use circuits, step targets, and time-efficient sessions when needed.
 - Emphasize mindset, adherence, and realistic timeframes rather than crash approaches.
-`.trim()
-  }
+`.trim(),
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ You specialize in safe, sustainable fat loss.
 async function getOpenAIClient() {
   const OpenAI = (await import("openai")).default;
   return new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
+    apiKey: process.env.OPENAI_API_KEY,
   });
 }
 
@@ -100,13 +100,14 @@ Limits & safety:
 - If something sounds medically serious, tell the user to talk to a qualified professional.
 - Be explicit when you are making reasonable assumptions.
 - IMPORTANT: Do NOT say you are unable to create or send files or PDFs. The Exerbud app can handle exporting and downloading plans for the user.
+- EQUALLY IMPORTANT: Do NOT claim that you are *currently* exporting, sending, or downloading a PDF file (for example, avoid phrases like "I’m sending the PDF now" or "you can download it right away"). Instead, clearly tell the user that IF they ask to export the plan as a PDF, the Exerbud app will handle the download on their side.
 
 Output style:
 - Start with 1–2 sentences reflecting what you understood.
 - Then give structured guidance with headings and bullet points.
 - End with 2–4 clear "Next steps" so the user knows exactly what to do.
 - Whenever you provide a full, structured workout plan, end with:
-  "If you’d like, I can also turn this into a downloadable PDF — just say “export this as a PDF.”"
+  "If you’d like, I can also turn this into a downloadable PDF — just say something like “export this as a PDF.”"
 `.trim();
 
   if (coach) {
@@ -203,12 +204,12 @@ Your job:
 Output format:
 - A short paragraph (max 120 words) in natural language.
 - If something is unknown, just omit it instead of guessing.
-`.trim()
+`.trim(),
       },
       {
         role: "user",
-        content: convoText
-      }
+        content: convoText,
+      },
     ];
 
     const completion = await client.chat.completions.create({
@@ -266,7 +267,7 @@ module.exports = async (req, res) => {
   const weeklyPlannerRequested = isWeeklyPlannerRequest(userMessage);
 
   // -------------------------------------------------------------------------
-  // Web Search
+  // Web Search (safe – wrapped in its own try/catch)
   // -------------------------------------------------------------------------
   let extraSearchContext = "";
   if (body.enableSearch !== false && shouldUseSearch(userMessage)) {
@@ -282,11 +283,7 @@ module.exports = async (req, res) => {
     }
   }
 
-  const systemPrompt = buildExerbudSystemPrompt(
-    extraSearchContext || undefined,
-    coachProfile
-  );
-
+  // History (text only) for context
   const historyMessages = history
     .filter((h) => h?.content)
     .slice(-MAX_HISTORY_MESSAGES)
@@ -295,12 +292,7 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
-  const client = await getOpenAIClient();
-
-  // ---------- Automatic User Profile Summary ----------
-  const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
-
-  // ---------- Attachments: Vision 2.0 + notes ----------
+  // Attachments: Vision 2.0 + notes (pure JS, no network)
   const visionImages = [];
   const nonImageAttachmentLines = [];
   const limited = attachments.slice(0, MAX_ATTACHMENTS);
@@ -354,59 +346,18 @@ module.exports = async (req, res) => {
         },
         ...visionImages.map((img) => ({
           type: "image_url",
-          image_url: { url: img.imageUrl }
+          image_url: { url: img.imageUrl },
         })),
       ],
     };
   }
 
-  const messages = [{ role: "system", content: systemPrompt }];
-
-  if (userProfileSummary) {
-    messages.push({
-      role: "system",
-      content:
-        "User profile summary based on the conversation so far (use this to keep recommendations consistent, and do NOT invent missing details):\n" +
-        userProfileSummary,
-    });
-  }
-
-  if (weeklyPlannerRequested) {
-    messages.push({
-      role: "system",
-      content: `
-The user is explicitly asking for a structured weekly training plan or multi-week calendar.
-When this is true, you MUST:
-
-- Build a clear plan organized by week and day.
-- Use headings like "Week 1", "Week 2", etc.
-- Inside each week, list training days in order with labels like "Mon", "Tue", "Wed" OR "Day 1", "Day 2" depending on what makes most sense.
-- Keep the total number of weekly sessions consistent with what the user can realistically do (from their profile and messages).
-- Include brief notes on progression across weeks (load, reps, difficulty, or volume) and when to deload.
-- Keep formatting clean and simple so it can be exported to a PDF or typed into a calendar.
-`.trim()
-    });
-  }
-
-  if (historyMessages.length > 0) {
-    messages.push(...historyMessages);
-  }
-
-  if (attachmentNote) {
-    messages.push({ role: "system", content: attachmentNote });
-  }
-
-  if (visionMessage) {
-    messages.push(visionMessage);
-  }
-
   const lastUserContent =
     userMessage ||
     "The user sent attachments without text. Use them for your reply.";
-  messages.push({ role: "user", content: lastUserContent });
 
   // -------------------------------------------------------------------------
-  // Start SSE Response
+  // Start SSE Response NOW so any later errors don't become HTTP 500
   // -------------------------------------------------------------------------
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -424,9 +375,64 @@ When this is true, you MUST:
   }
 
   // -------------------------------------------------------------------------
-  // OpenAI Streaming
+  // OpenAI Streaming (everything risky is inside this try/catch)
   // -------------------------------------------------------------------------
   try {
+    const client = await getOpenAIClient();
+
+    // User profile summary (memory-lite)
+    const userProfileSummary = await buildUserProfileSummary(
+      client,
+      historyMessages
+    );
+
+    const systemPrompt = buildExerbudSystemPrompt(
+      extraSearchContext || undefined,
+      coachProfile
+    );
+
+    const messages = [{ role: "system", content: systemPrompt }];
+
+    if (userProfileSummary) {
+      messages.push({
+        role: "system",
+        content:
+          "User profile summary based on the conversation so far (use this to keep recommendations consistent, and do NOT invent missing details):\n" +
+          userProfileSummary,
+      });
+    }
+
+    if (weeklyPlannerRequested) {
+      messages.push({
+        role: "system",
+        content: `
+The user is explicitly asking for a structured weekly training plan or multi-week calendar.
+When this is true, you MUST:
+
+- Build a clear plan organized by week and day.
+- Use headings like "Week 1", "Week 2", etc.
+- Inside each week, list training days in order with labels like "Mon", "Tue", "Wed" OR "Day 1", "Day 2" depending on what makes most sense.
+- Keep the total number of weekly sessions consistent with what the user can realistically do (from their profile and messages).
+- Include brief notes on progression across weeks (load, reps, difficulty, or volume) and when to deload.
+- Keep formatting clean and simple so it can be exported to a PDF or typed into a calendar.
+`.trim(),
+      });
+    }
+
+    if (historyMessages.length > 0) {
+      messages.push(...historyMessages);
+    }
+
+    if (attachmentNote) {
+      messages.push({ role: "system", content: attachmentNote });
+    }
+
+    if (visionMessage) {
+      messages.push(visionMessage);
+    }
+
+    messages.push({ role: "user", content: lastUserContent });
+
     const stream = await client.chat.completions.create({
       model: DEFAULT_MODEL,
       messages,
