@@ -6,6 +6,7 @@
 // Mirrors the logic of /api/exerbud-ai.js, but returns tokens as they arrive.
 //
 
+const OpenAI = require("openai");
 const { webSearch } = require("./utils/web-search");
 
 // ---------------------------------------------------------------------------
@@ -14,87 +15,176 @@ const { webSearch } = require("./utils/web-search");
 const DEFAULT_MODEL = process.env.EXERBUD_MODEL || "gpt-4.1-mini";
 const MAX_HISTORY_MESSAGES = 20;
 const MAX_SEARCH_CONTEXT_CHARS = 8000;
-const MAX_ATTACHMENTS = 8;
+const MAX_ATTACHMENT_NOTE_CHARS = 1200;
+
+// Vision / attachment constraints (also enforced client-side)
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_TOTAL_ATTACHMENT_BYTES = 8 * 1024 * 1024; // 8MB
 
 // ---------------------------------------------------------------------------
-// Coach profiles
+// Helper: basic CORS headers (adjust origin if you want to lock it down)
+// ---------------------------------------------------------------------------
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI client helper
+// ---------------------------------------------------------------------------
+async function getOpenAIClient() {
+  return new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Simple coach profiles (lightweight "personas")
 // ---------------------------------------------------------------------------
 const COACH_PROFILES = {
   strength: {
-    name: "Strength Coach",
-    style: `
-You specialize in strength training and progressive overload.
-- Focus on compound lifts, measurable progress, and consistent technique.
-- You care about long-term joint health as much as numbers on the bar.
-- You prefer clear cues and simple, repeatable programming.
-`.trim()
+    label: "Strength",
+    description:
+      "Focus on getting stronger in the main barbell and compound lifts with simple, progressive programming.",
   },
   hypertrophy: {
-    name: "Hypertrophy Coach",
-    style: `
-You specialize in muscle growth and physique-focused training.
-- Focus on volume landmarks, proximity to failure, and exercise selection.
-- You think in terms of muscle groups, tension, and mind–muscle connection.
-- You use straightforward language that avoids overcomplication.
-`.trim()
+    label: "Hypertrophy",
+    description:
+      "Prioritize muscle growth with higher volume, a variety of rep ranges, and smart exercise selection.",
   },
   mobility: {
-    name: "Mobility Specialist",
-    style: `
-You specialize in mobility, flexibility, and joint health.
-- Focus on controlled range of motion, breathing, and posture.
-- Include warm-up, cooldown, and simple daily movement habits.
-- Prioritize pain-free movement and regressions over forcing range of motion.
-`.trim()
+    label: "Mobility",
+    description:
+      "Emphasize joint health, range of motion, and movement quality alongside strength work.",
   },
   fat_loss: {
-    name: "Fat Loss Coach",
-    style: `
-You specialize in safe, sustainable fat loss.
-- Focus on energy expenditure, consistency, and building habits that are actually doable.
-- Use circuits, step targets, and time-efficient sessions when needed.
-- Emphasize mindset, adherence, and realistic timeframes rather than crash approaches.
-`.trim()
-  }
+    label: "Fat loss",
+    description:
+      "Support sustainable fat loss with realistic training volume and an eye on recovery and adherence.",
+  },
 };
 
 // ---------------------------------------------------------------------------
-// Lazy-load OpenAI client
+// Utility: normalize/trim conversation history
 // ---------------------------------------------------------------------------
-async function getOpenAIClient() {
-  const OpenAI = (await import("openai")).default;
-  return new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
-  });
+function sanitizeHistory(rawHistory) {
+  if (!Array.isArray(rawHistory)) return [];
+
+  return rawHistory
+    .slice(-MAX_HISTORY_MESSAGES)
+    .map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: typeof m.content === "string" ? m.content.slice(0, 4000) : "",
+      timestamp: m.timestamp || Date.now(),
+    }))
+    .filter((m) => m.content);
 }
 
 // ---------------------------------------------------------------------------
-// Utility: basic attachment summary
+// Utility: make a small, human-readable summary of uploaded files
+// (non-images are only described here; images may also be sent to Vision)
 // ---------------------------------------------------------------------------
-function summarizeAttachments(attachments) {
+function buildAttachmentNote(attachments) {
   if (!Array.isArray(attachments) || !attachments.length) return "";
 
-  const limited = attachments.slice(0, MAX_ATTACHMENTS);
-  const parts = limited.map((file, idx) => {
-    const kind = file.type || "file";
-    const sizeKb = file.size ? Math.round(file.size / 1024) : null;
-    const sizeLabel = sizeKb ? `${sizeKb}KB` : "unknown size";
-    return `  - [${idx + 1}] ${file.name || "unnamed"} (${kind}, ${sizeLabel})`;
-  });
+  const parts = [];
+  let totalBytes = 0;
 
-  let note = "The user attached the following files:\n" + parts.join("\n");
+  for (const file of attachments) {
+    if (!file || !file.name) continue;
+    const size = Number(file.size) || 0;
+    totalBytes += size;
 
-  if (attachments.length > MAX_ATTACHMENTS) {
-    note += `\n  - (There are ${attachments.length - MAX_ATTACHMENTS} more files not listed here.)`;
+    const isImage =
+      typeof file.type === "string" && file.type.toLowerCase().startsWith("image/");
+
+    parts.push(
+      `- ${file.name} (${isImage ? "image" : "file"}, approx ${
+        size > 0 ? Math.round(size / 1024) + "KB" : "unknown size"
+      })`
+    );
   }
 
-  note +=
-    "\n\nIf you need to reference a file, mention it by index (e.g. 'in file #1').";
-  return note;
+  let note = `The user has attached the following files:\n${parts.join("\n")}`;
+
+  if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+    note +=
+      "\n\nNote: Total attachment size is quite large. Focus on high-level insights rather than pixel-perfect details.";
+  }
+
+  return note.slice(0, MAX_ATTACHMENT_NOTE_CHARS);
 }
 
 // ---------------------------------------------------------------------------
-// Build system prompt
+// Utility: extract up to N base64 images from attachments for Vision
+// ---------------------------------------------------------------------------
+function extractImageInputs(attachments) {
+  if (!Array.isArray(attachments)) return [];
+
+  const imageInputs = [];
+  let totalBytes = 0;
+
+  for (const file of attachments) {
+    if (imageInputs.length >= MAX_IMAGE_ATTACHMENTS) break;
+    if (!file || !file.type || !file.data) continue;
+
+    const isImage = file.type.toLowerCase().startsWith("image/");
+    if (!isImage) continue;
+
+    const size = Number(file.size) || 0;
+    totalBytes += size;
+    if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) break;
+
+    imageInputs.push({
+      type: "input_image",
+      image_url: {
+        url: `data:${file.type};base64,${file.data}`,
+      },
+    });
+  }
+
+  return imageInputs;
+}
+
+// ---------------------------------------------------------------------------
+// Utility: optional web search (Google CSE wrapper)
+// ---------------------------------------------------------------------------
+async function maybeRunSearch(userMessage, enableSearch) {
+  if (!enableSearch) return null;
+  if (!userMessage || typeof userMessage !== "string") return null;
+
+  const lower = userMessage.toLowerCase();
+
+  const looksLikeSearch =
+    /\b(near me|gyms?|personal trainers?|coach|best [^.?]{0,30}|review|compare|vs\.?)\b/.test(
+      lower
+    ) || /https?:\/\//.test(lower);
+
+  if (!looksLikeSearch) return null;
+
+  try {
+    const results = await webSearch(userMessage);
+    if (!results || !Array.isArray(results.items) || !results.items.length) return null;
+
+    const items = results.items.slice(0, 5);
+
+    let text = "Here are some recent web search results that may be useful:\n\n";
+    for (const item of items) {
+      text += `- **${item.title || "Result"}** — ${item.snippet || ""}\n  ${item.link}\n\n`;
+    }
+
+    return text.slice(0, MAX_SEARCH_CONTEXT_CHARS);
+  } catch (err) {
+    console.error("Exerbud web search error:", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extended system prompt builder
 // ---------------------------------------------------------------------------
 function buildExerbudSystemPrompt(extraContext, coachProfileKey) {
   const coach =
@@ -124,7 +214,7 @@ Limits & safety:
 - Do not estimate bodyfat percentage, diagnosis, or medical risk.
 - If something sounds medically serious, tell the user to talk to a qualified professional.
 - Be explicit when you are making reasonable assumptions.
-- IMPORTANT: Do NOT say you are unable to create or send files or PDFs. When the user asks to export or download their plan, simply describe the plan clearly; the Exerbud app can handle exporting and downloading plans for the user.
+- IMPORTANT: Do NOT say you are unable to create or send files or PDFs — the Exerbud app can handle exporting and downloading plans for the user.
 
 Output style:
 - Start with 1–2 short sentences reflecting what you understood.
@@ -139,148 +229,86 @@ Output style:
   if (coach) {
     base += `
 
-You are currently operating as a ${coach.name}.
-Adopt this coaching style:
-${coach.style}
+Active coach style:
+- Name: ${coach.label}
+- How this should affect your answers: ${coach.description}
 `;
-  } else {
+  }
+
+  if (extraContext && typeof extraContext === "string") {
     base += `
 
-If the user hasn't chosen a coach profile, use a balanced generalist style.
+Additional context from tools or system:
+${extraContext}
 `;
   }
 
-  if (!extraContext) return base;
-
-  return (
-    base +
-    "\n\nAdditional live web context:\n" +
-    extraContext +
-    "\n\n(Reference this info as coming from live search, not memory.)"
-  );
+  return base;
 }
 
 // ---------------------------------------------------------------------------
-// Should we run web search?
+// Weekly planner / calendar helper – compresses recent convo
 // ---------------------------------------------------------------------------
-function shouldUseSearch(message) {
-  if (!message) return false;
-  const lower = message.toLowerCase();
+async function summarizeRecentConversationForPlanner(client, history, userMessage) {
+  try {
+    const recent = (history || []).slice(-10);
+    const convoText = recent
+      .map((m) => `${m.role === "assistant" ? "Coach" : "User"}: ${m.content}`)
+      .join("\n")
+      .slice(0, 6000);
 
-  if (
-    lower.includes("find a gym") ||
-    lower.includes("gyms near me") ||
-    lower.includes("find personal trainer") ||
-    lower.includes("personal trainers near me")
-  ) {
-    return true;
-  }
+    const messages = [
+      {
+        role: "system",
+        content: `
+You are helping Exerbud condense the user's recent conversation into a short summary
+for a weekly workout planner. Extract only the key facts:
 
-  if (
-    lower.includes("near me") ||
-    lower.includes("closest") ||
-    lower.includes("best gym") ||
-    lower.includes("open now")
-  ) {
-    return true;
-  }
+- Training experience and background.
+- Main goals and constraints.
+- Weekly availability (days, session length) if mentioned.
+- Equipment access.
+- Any injuries, limitations, or strong preferences.
 
-  if (
-    lower.includes("latest research") ||
-    lower.includes("study on") ||
-    lower.includes("recent guidelines")
-  ) {
-    return true;
-  }
+Return 4–8 bullet points, nothing else.
+      `.trim(),
+      },
+      {
+        role: "user",
+        content: convoText + "\n\nUser's latest request:\n" + (userMessage || ""),
+      },
+    ];
 
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-// Build message history for OpenAI
-// ---------------------------------------------------------------------------
-async function buildMessages({
-  userMessage,
-  history,
-  attachments,
-  enableSearch,
-  coachProfile
-}) {
-  const trimmedHistory = Array.isArray(history)
-    ? history.slice(-MAX_HISTORY_MESSAGES)
-    : [];
-
-  let webContext = "";
-  if (enableSearch && shouldUseSearch(userMessage)) {
-    try {
-      const results = await webSearch(userMessage);
-      if (results && results.length) {
-        const joined = results
-          .map(
-            (r, idx) =>
-              `Result ${idx + 1}: ${r.title}\n${r.snippet}\n${r.link}\n`
-          )
-          .join("\n");
-
-        webContext =
-          joined.length > MAX_SEARCH_CONTEXT_CHARS
-            ? joined.slice(0, MAX_SEARCH_CONTEXT_CHARS) +
-              "\n\n(Truncated search results.)"
-            : joined;
-      }
-    } catch (err) {
-      console.error("Web search error:", err);
-    }
-  }
-
-  let attachmentNote = "";
-  if (attachments && attachments.length) {
-    attachmentNote = summarizeAttachments(attachments);
-  }
-
-  const systemText = buildExerbudSystemPrompt(
-    webContext,
-    coachProfile || null
-  );
-
-  const messages = [
-    {
-      role: "system",
-      content: systemText
-    }
-  ];
-
-  if (attachmentNote) {
-    messages.push({
-      role: "system",
-      content: attachmentNote
+    const completion = await client.chat.completions.create({
+      model: DEFAULT_MODEL,
+      messages,
+      temperature: 0,
+      max_tokens: 220,
     });
+
+    const summary = completion.choices?.[0]?.message?.content?.trim();
+    return summary || null;
+  } catch (err) {
+    console.error("Planner summarization error:", err);
+    return null;
   }
-
-  trimmedHistory.forEach(msg => {
-    if (!msg || !msg.role || !msg.content) return;
-    const r = msg.role === "assistant" ? "assistant" : "user";
-    messages.push({
-      role: r,
-      content: msg.content
-    });
-  });
-
-  messages.push({
-    role: "user",
-    content: userMessage
-  });
-
-  return messages;
 }
 
 // ---------------------------------------------------------------------------
-// Streaming handler
+// Main handler – SSE streaming
 // ---------------------------------------------------------------------------
-async function handler(req, res) {
+module.exports = async (req, res) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(200, corsHeaders());
+    res.end();
+    return;
+  }
+
   if (req.method !== "POST") {
-    res.setHeader("Content-Type", "application/json");
-    res.statusCode = 405;
+    res.writeHead(405, {
+      ...corsHeaders(),
+      "Content-Type": "application/json",
+    });
     res.end(JSON.stringify({ error: "Method not allowed" }));
     return;
   }
@@ -288,9 +316,7 @@ async function handler(req, res) {
   try {
     const body = await new Promise((resolve, reject) => {
       let data = "";
-      req.on("data", chunk => {
-        data += chunk.toString();
-      });
+      req.on("data", (chunk) => (data += chunk));
       req.on("end", () => {
         try {
           resolve(JSON.parse(data || "{}"));
@@ -305,81 +331,131 @@ async function handler(req, res) {
       message,
       history,
       attachments,
-      enableSearch = true,
-      coachProfile = null
+      enableSearch,
+      coachProfile,
+      plannerMode,
     } = body || {};
 
-    if (!message && !(attachments && attachments.length)) {
-      res.setHeader("Content-Type", "application/json");
-      res.statusCode = 400;
-      res.end(JSON.stringify({ error: "Missing message." }));
+    const userMessage = typeof message === "string" ? message.trim() : "";
+
+    if (!userMessage && (!attachments || !attachments.length)) {
+      res.writeHead(400, {
+        ...corsHeaders(),
+        "Content-Type": "application/json",
+      });
+      res.end(JSON.stringify({ error: "Empty message" }));
       return;
     }
 
+    const sanitizedHistory = sanitizeHistory(history);
+
+    // Build extra context: web search + attachment note
+    const [searchContext] = await Promise.all([
+      maybeRunSearch(userMessage, enableSearch),
+    ]);
+    const attachmentNote = buildAttachmentNote(attachments);
+    const extraPieces = [searchContext, attachmentNote].filter(Boolean);
+    const extraContext = extraPieces.length ? extraPieces.join("\n\n") : null;
+
     const client = await getOpenAIClient();
-    const messages = await buildMessages({
-      userMessage: message || "",
-      history: history || [],
-      attachments: attachments || [],
-      enableSearch,
+
+    // Optional: if this looks like a weekly planner request, add a compressed summary
+    let plannerSummary = null;
+    if (plannerMode) {
+      plannerSummary = await summarizeRecentConversationForPlanner(
+        client,
+        sanitizedHistory,
+        userMessage
+      );
+    }
+
+    const systemPrompt = buildExerbudSystemPrompt(
+      [extraContext, plannerSummary].filter(Boolean).join("\n\n"),
       coachProfile
+    );
+
+    const imageInputs = extractImageInputs(attachments);
+
+    const messages = [];
+
+    messages.push({
+      role: "system",
+      content: systemPrompt,
     });
 
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders?.();
+    sanitizedHistory.forEach((m) => {
+      messages.push({
+        role: m.role,
+        content: m.content,
+      });
+    });
 
-    function sendChunk(text) {
-      if (!text) return;
-      res.write(`data:${text}\n\n`);
+    // Build the user content: text + optional vision parts
+    if (imageInputs.length) {
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: userMessage || "The user attached images and would like your help.",
+          },
+          ...imageInputs,
+        ],
+      });
+    } else {
+      messages.push({
+        role: "user",
+        content: userMessage || "The user attached files and wants your help with them.",
+      });
     }
+
+    // Start SSE response
+    res.writeHead(200, {
+      ...corsHeaders(),
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
 
     const stream = await client.chat.completions.create({
       model: DEFAULT_MODEL,
       messages,
-      temperature: 0.4,
-      max_tokens: 1200,
-      stream: true
+      temperature: 0.6,
+      max_tokens: 1400,
+      stream: true,
     });
 
     let fullText = "";
 
     for await (const chunk of stream) {
-      const delta =
-        chunk.choices?.[0]?.delta?.content ??
-        chunk.choices?.[0]?.delta?.text ??
-        "";
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta?.content || "";
+
       if (!delta) continue;
+
       fullText += delta;
-      sendChunk(delta);
+      // NOTE: we send the raw delta (including spaces) and let the frontend decide formatting.
+      res.write(`data: ${delta}\n\n`);
     }
 
-    res.write("data:[DONE]\n\n");
+    res.write("data: [DONE]\n\n");
     res.end();
   } catch (err) {
-    console.error("Exerbud SSE handler error:", err);
+    console.error("Exerbud streaming error:", err);
     if (!res.headersSent) {
-      res.setHeader("Content-Type", "application/json");
-      res.statusCode = 500;
-      res.end(
-        JSON.stringify({
-          error: "Exerbud streaming error",
-          details: err?.message || String(err)
-        })
-      );
+      res.writeHead(500, {
+        ...corsHeaders(),
+        "Content-Type": "application/json",
+      });
+      res.end(JSON.stringify({ error: "Internal server error" }));
     } else {
       try {
-        res.write(
-          `data:${"⚠️ Streaming error from Exerbud. Please try again."}\n\n`
-        );
-        res.write("data:[DONE]\n\n");
+        res.write(`data: [ERROR] Something went wrong on the server.\n\n`);
+        res.write("data: [DONE]\n\n");
         res.end();
-      } catch (_) {
+      } catch (e) {
         // ignore
       }
     }
   }
-}
-
-module.exports = handler;
+};
