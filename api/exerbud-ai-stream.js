@@ -2,9 +2,8 @@
 //
 // Exerbud AI – SSE Streaming Endpoint
 // -------------------------------------
-// This endpoint produces REAL streaming responses using Server-Sent Events (SSE).
-// It mirrors the logic of /api/exerbud-ai.js but returns tokens as they arrive.
-// Safe to run alongside your existing non-streaming endpoint.
+// Produces REAL streaming responses using Server-Sent Events (SSE).
+// Mirrors the logic of /api/exerbud-ai.js, but returns tokens as they arrive.
 //
 
 const { webSearch } = require("./utils/web-search");
@@ -60,7 +59,7 @@ You specialize in safe, sustainable fat loss.
 };
 
 // ---------------------------------------------------------------------------
-// Lazy-load OpenAI client (required for openai@4.x in CJS)
+// Lazy-load OpenAI client
 // ---------------------------------------------------------------------------
 async function getOpenAIClient() {
   const OpenAI = (await import("openai")).default;
@@ -70,7 +69,7 @@ async function getOpenAIClient() {
 }
 
 // ---------------------------------------------------------------------------
-// Build System Prompt (same as main endpoint)
+// Build System Prompt (same as main endpoint, shorter web note)
 // ---------------------------------------------------------------------------
 function buildExerbudSystemPrompt(extraContext, coachProfileKey) {
   const coach =
@@ -92,10 +91,12 @@ You can:
 - Help with exercise selection, sets/reps, weekly splits, progression, deloads.
 - Interpret descriptions of gym equipment, constraints, and schedules.
 - Visually analyze user-uploaded photos (form, equipment, gym layout, etc.) to give practical feedback.
+- When multiple images are provided, you can compare them and describe differences in form, posture, body position, or environment.
 - With help from the Exerbud app, export the latest workout plan as a downloadable PDF whenever the user asks.
 
 Limits & safety:
 - Do NOT diagnose injuries or medical issues and never prescribe drugs.
+- Do not estimate bodyfat percentage, diagnosis, or medical risk.
 - If something sounds medically serious, tell the user to talk to a qualified professional.
 - Be explicit when you are making reasonable assumptions.
 - IMPORTANT: Do NOT say you are unable to create or send files or PDFs. The Exerbud app can handle exporting and downloading plans for the user.
@@ -255,9 +256,6 @@ module.exports = async (req, res) => {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Build Chat Messages (same as main endpoint)
-  // -------------------------------------------------------------------------
   const systemPrompt = buildExerbudSystemPrompt(
     extraSearchContext || undefined,
     coachProfile
@@ -271,47 +269,70 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
-  // Vision attachments → convert into message objects
-  const imageMessages = [];
-  const attachmentNoteParts = [];
+  const client = await getOpenAIClient();
 
+  // ---------- Automatic User Profile Summary ----------
+  const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
+
+  // ---------- Attachments: Vision 2.0 + non-image notes ----------
+  const visionImages = [];
+  const nonImageAttachmentLines = [];
   const limited = attachments.slice(0, MAX_ATTACHMENTS);
 
-  for (const att of limited) {
-    const name = att?.name || "file";
-    const mime = att?.type || "";
-    const sizeKb = att?.size ? Math.round(att.size / 1024) : null;
+  for (let i = 0; i < limited.length; i++) {
+    const att = limited[i];
+    if (!att) continue;
 
-    attachmentNoteParts.push(
-      `- ${name} (${mime}${sizeKb ? `, ~${sizeKb} KB` : ""})`
-    );
+    const name = att.name || `file-${i + 1}`;
+    const mime = att.type || "unknown";
+    const sizeKb = att.size ? Math.round(att.size / 1024) : null;
 
-    if (mime.startsWith("image/")) {
+    if (mime.startsWith("image/") && att.data) {
       const dataUrl = `data:${mime};base64,${att.data}`;
-      imageMessages.push({
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `User uploaded an image (${name}). Use it as context.`,
-          },
-          {
-            type: "image_url",
-            image_url: { url: dataUrl },
-          },
-        ],
-      });
+      visionImages.push({ name, imageUrl: dataUrl });
+    } else {
+      nonImageAttachmentLines.push(
+        `- ${name} (${mime}${sizeKb ? `, ~${sizeKb} KB` : ""})`
+      );
     }
   }
 
   let attachmentNote = "";
-  if (attachmentNoteParts.length > 0) {
+  if (nonImageAttachmentLines.length > 0) {
     attachmentNote =
-      "The user uploaded these files:\n" + attachmentNoteParts.join("\n");
+      "The user also uploaded these non-image files. You CANNOT see their content directly, but you may infer from the rest of the conversation when helpful:\n" +
+      nonImageAttachmentLines.join("\n");
   }
 
-  const client = await getOpenAIClient();
-  const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
+  let visionMessage = null;
+  if (visionImages.length > 0) {
+    visionMessage = {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text:
+            `The user has uploaded ${visionImages.length} fitness-related image(s). ` +
+            `Treat them as photos or still frames of exercises, body positions, or gym/home environments. ` +
+            `Your job is to:\n` +
+            `1) Describe what you see in each image (exercise, angle, stance, posture, visible equipment, environment).\n` +
+            `2) Provide detailed but supportive coaching feedback on form, setup, and positioning.\n` +
+            `3) Suggest 2–4 concrete cues the user can try next time (for example: "brace before you descend", "slow the eccentric", "keep ribs stacked over pelvis").\n` +
+            `4) If there are multiple images, compare them: mention improvements, regressions, changes in depth, knee travel, torso angle, bar path, or equipment/room differences.\n\n` +
+            `Guardrails:\n` +
+            `- Do NOT diagnose injuries or medical conditions.\n` +
+            `- Do NOT estimate body fat percentage or make aesthetic judgements.\n` +
+            `- Stay focused on performance, movement quality, and safety.\n` +
+            `- Use encouraging, non-shaming language.\n` +
+            `You can refer to them as "image 1", "image 2", etc. in the order they were provided.`,
+        },
+        ...visionImages.map((img) => ({
+          type: "image_url",
+          image_url: { url: img.imageUrl }
+        })),
+      ],
+    };
+  }
 
   const messages = [{ role: "system", content: systemPrompt }];
 
@@ -332,8 +353,8 @@ module.exports = async (req, res) => {
     messages.push({ role: "system", content: attachmentNote });
   }
 
-  if (imageMessages.length > 0) {
-    messages.push(...imageMessages);
+  if (visionMessage) {
+    messages.push(visionMessage);
   }
 
   const lastUserContent =
@@ -350,7 +371,6 @@ module.exports = async (req, res) => {
     Connection: "keep-alive",
   });
 
-  // Helper to send SSE chunks:
   function sendChunk(token) {
     res.write(`data: ${token}\n\n`);
   }

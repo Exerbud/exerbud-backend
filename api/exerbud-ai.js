@@ -83,10 +83,12 @@ You can:
 - Help with exercise selection, sets/reps, weekly splits, progression, deloads.
 - Interpret descriptions of gym equipment, constraints, and schedules.
 - Visually analyze user-uploaded photos (form, equipment, gym layout, etc.) to give practical feedback.
+- When multiple images are provided, you can compare them and describe differences in form, posture, body position, or environment.
 - With help from the Exerbud app, export the latest workout plan as a downloadable PDF whenever the user asks.
 
 Limits & safety:
 - Do NOT diagnose injuries or medical issues and never prescribe drugs.
+- Do not estimate bodyfat percentage, diagnosis, or medical risk.
 - If something sounds medically serious, tell the user to talk to a qualified professional.
 - Be explicit when you are making reasonable assumptions.
 - IMPORTANT: Do NOT say you are unable to create or send files or PDFs. The Exerbud app can handle exporting and downloading plans for the user.
@@ -455,57 +457,78 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
-  // Attachments → Vision + note
+  const client = await getOpenAIClient();
+
+  // ---------- Automatic User Profile Summary ----------
+  const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
+
+  // ---------- Attachments: Vision 2.0 + non-image notes ----------
   let attachmentNote = "";
-  const imageMessages = [];
+  const visionImages = [];
+  const nonImageAttachmentLines = [];
+
   const limitedAttachments = attachments.slice(0, MAX_ATTACHMENTS);
 
   if (limitedAttachments.length > 0) {
-    const lines = limitedAttachments.map((att, idx) => {
-      const name = att?.name || `file-${idx + 1}`;
-      const type = att?.type || "unknown";
-      const sizeKb = att?.size ? Math.round(att.size / 1024) : null;
-      return `- ${name} (${type}${sizeKb ? `, ~${sizeKb} KB` : ""})`;
+    limitedAttachments.forEach((att, idx) => {
+      if (!att) return;
+      const name = att.name || `file-${idx + 1}`;
+      const type = att.type || "unknown";
+      const sizeKb = att.size ? Math.round(att.size / 1024) : null;
+
+      if (type.startsWith("image/") && att.data) {
+        const imageUrl = `data:${type};base64,${att.data}`;
+        visionImages.push({ name, imageUrl });
+      } else {
+        nonImageAttachmentLines.push(
+          `- ${name} (${type}${sizeKb ? `, ~${sizeKb} KB` : ""})`
+        );
+      }
     });
+  }
 
+  if (nonImageAttachmentLines.length > 0) {
     attachmentNote =
-      "The user also uploaded these files; use them as extra context. For images, you can visually inspect them:\n" +
-      lines.join("\n");
+      "The user also uploaded these non-image files. You CANNOT see their content directly, but you may infer from the rest of the conversation when helpful:\n" +
+      nonImageAttachmentLines.join("\n");
+  }
 
-    for (const att of limitedAttachments) {
-      if (!att || !att.data || !att.type) continue;
-      const mime = att.type || "application/octet-stream";
-
-      if (!mime.startsWith("image/")) continue;
-
-      const imageUrl = `data:${mime};base64,${att.data}`;
-
-      imageMessages.push({
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text:
-              `User uploaded an image (${att.name || "image"}). ` +
-              `Visually inspect it and use it as context for your reply.`,
-          },
-          {
-            type: "image_url",
-            image_url: { url: imageUrl },
-          },
-        ],
-      });
-    }
+  let visionMessage = null;
+  if (visionImages.length > 0) {
+    visionMessage = {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text:
+            `The user has uploaded ${visionImages.length} fitness-related image(s). ` +
+            `Treat them as photos or still frames of exercises, body positions, or gym/home environments. ` +
+            `Your job is to:\n` +
+            `1) Describe what you see in each image (exercise, angle, stance, posture, visible equipment, environment).\n` +
+            `2) Provide detailed but supportive coaching feedback on form, setup, and positioning.\n` +
+            `3) Suggest 2–4 concrete cues the user can try next time (e.g. "brace before you descend", "slow down the eccentric") for each relevant image.\n` +
+            `4) If there are multiple images, compare them: mention improvements, regressions, changes in depth, knee travel, torso angle, bar path, or equipment/room differences.\n\n` +
+            `Guardrails:\n` +
+            `- Do NOT diagnose injuries or medical conditions.\n` +
+            `- Do NOT estimate body fat percentage or make aesthetic judgements.\n` +
+            `- Stay focused on performance, movement quality, and safety.\n` +
+            `- Use encouraging, non-shaming language.\n` +
+            `You can refer to them as "image 1", "image 2", etc. in the order they were provided.`,
+        },
+        ...visionImages.map((img, idx) => ({
+          type: "image_url",
+          image_url: {
+            url: img.imageUrl
+          }
+        })),
+      ],
+    };
   }
 
   const systemPrompt = buildExerbudSystemPrompt(
     extraSearchContext || undefined,
     coachProfile
   );
-
-  // ---------- Automatic User Profile Summary ----------
-  const client = await getOpenAIClient();
-  const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
 
   const messages = [{ role: "system", content: systemPrompt }];
 
@@ -526,8 +549,8 @@ module.exports = async (req, res) => {
     messages.push({ role: "system", content: attachmentNote });
   }
 
-  if (imageMessages.length > 0) {
-    messages.push(...imageMessages);
+  if (visionMessage) {
+    messages.push(visionMessage);
   }
 
   const lastUserContent =
