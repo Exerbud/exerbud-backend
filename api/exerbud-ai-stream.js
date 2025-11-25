@@ -6,11 +6,8 @@
 // It mirrors the logic of /api/exerbud-ai.js but returns tokens as they arrive.
 // Safe to run alongside your existing non-streaming endpoint.
 //
-// DROP-IN READY FOR VERSEL
-//
 
 const { webSearch } = require("./utils/web-search");
-const https = require("https");
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -151,6 +148,61 @@ function shouldUseSearch(message) {
 }
 
 // ---------------------------------------------------------------------------
+// Automatic User Profile Summary (Option A)
+// ---------------------------------------------------------------------------
+async function buildUserProfileSummary(client, historyMessages) {
+  if (!historyMessages || historyMessages.length === 0) return null;
+
+  try {
+    const convoText = historyMessages
+      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+      .join("\n\n")
+      .slice(0, 8000);
+
+    const messages = [
+      {
+        role: "system",
+        content: `
+You are a fitness coach assistant that extracts a compact user fitness profile from the conversation so far.
+
+Your job:
+- Summarize ONLY what the user has clearly stated about:
+  - Training experience (beginner/intermediate/advanced, or unknown)
+  - Main goals (strength, hypertrophy, fat loss, performance, health, etc.)
+  - Weekly schedule and constraints (how many days, time limits, lifestyle)
+  - Equipment available (gym access, home equipment, specific tools)
+  - Injury or medical considerations (ONLY if explicitly mentioned)
+  - Strong preferences (e.g. hates running, loves heavy lifting, etc.)
+- Do NOT invent or guess details that were not clearly stated.
+
+Output format:
+- A short paragraph (max 120 words) in natural language.
+- If something is unknown, just omit it instead of guessing.
+`.trim()
+      },
+      {
+        role: "user",
+        content: convoText
+      }
+    ];
+
+    const completion = await client.chat.completions.create({
+      model: DEFAULT_MODEL,
+      messages,
+      temperature: 0,
+      max_tokens: 220,
+    });
+
+    const summary = completion.choices?.[0]?.message?.content?.trim();
+    if (!summary) return null;
+    return summary;
+  } catch (err) {
+    console.error("User profile summary (stream) error:", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // SSE streaming endpoint
 // ---------------------------------------------------------------------------
 module.exports = async (req, res) => {
@@ -199,7 +251,7 @@ module.exports = async (req, res) => {
         extraSearchContext = serialized.slice(0, MAX_SEARCH_CONTEXT_CHARS);
       }
     } catch (err) {
-      console.error("Search error:", err);
+      console.error("Search error (stream):", err);
     }
   }
 
@@ -258,14 +310,28 @@ module.exports = async (req, res) => {
       "The user uploaded these files:\n" + attachmentNoteParts.join("\n");
   }
 
+  const client = await getOpenAIClient();
+  const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
+
   const messages = [{ role: "system", content: systemPrompt }];
+
+  if (userProfileSummary) {
+    messages.push({
+      role: "system",
+      content:
+        "User profile summary based on the conversation so far (use this to keep recommendations consistent, and do NOT invent missing details):\n" +
+        userProfileSummary,
+    });
+  }
 
   if (historyMessages.length > 0) {
     messages.push(...historyMessages);
   }
+
   if (attachmentNote) {
     messages.push({ role: "system", content: attachmentNote });
   }
+
   if (imageMessages.length > 0) {
     messages.push(...imageMessages);
   }
@@ -273,7 +339,6 @@ module.exports = async (req, res) => {
   const lastUserContent =
     userMessage ||
     "The user sent attachments without text. Use them for your reply.";
-
   messages.push({ role: "user", content: lastUserContent });
 
   // -------------------------------------------------------------------------
@@ -299,8 +364,6 @@ module.exports = async (req, res) => {
   // OpenAI Streaming
   // -------------------------------------------------------------------------
   try {
-    const client = await getOpenAIClient();
-
     const stream = await client.chat.completions.create({
       model: DEFAULT_MODEL,
       messages,

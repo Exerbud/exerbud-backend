@@ -288,6 +288,61 @@ async function generatePlanPdf(planText, planTitle) {
 }
 
 // ---------------------------------------------------------------------------
+// Automatic User Profile Summary (Option A)
+// ---------------------------------------------------------------------------
+async function buildUserProfileSummary(client, historyMessages) {
+  if (!historyMessages || historyMessages.length === 0) return null;
+
+  try {
+    const convoText = historyMessages
+      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+      .join("\n\n")
+      .slice(0, 8000); // safety cap
+
+    const messages = [
+      {
+        role: "system",
+        content: `
+You are a fitness coach assistant that extracts a compact user fitness profile from the conversation so far.
+
+Your job:
+- Summarize ONLY what the user has clearly stated about:
+  - Training experience (beginner/intermediate/advanced, or unknown)
+  - Main goals (strength, hypertrophy, fat loss, performance, health, etc.)
+  - Weekly schedule and constraints (how many days, time limits, lifestyle)
+  - Equipment available (gym access, home equipment, specific tools)
+  - Injury or medical considerations (ONLY if explicitly mentioned)
+  - Strong preferences (e.g. hates running, loves heavy lifting, etc.)
+- Do NOT invent or guess details that were not clearly stated.
+
+Output format:
+- A short paragraph (max 120 words) in natural language.
+- If something is unknown, just omit it instead of guessing.
+`.trim()
+      },
+      {
+        role: "user",
+        content: convoText
+      }
+    ];
+
+    const completion = await client.chat.completions.create({
+      model: DEFAULT_MODEL,
+      messages,
+      temperature: 0,
+      max_tokens: 220,
+    });
+
+    const summary = completion.choices?.[0]?.message?.content?.trim();
+    if (!summary) return null;
+    return summary;
+  } catch (err) {
+    console.error("User profile summary error:", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 module.exports = async (req, res) => {
@@ -400,6 +455,7 @@ module.exports = async (req, res) => {
       content: h.content,
     }));
 
+  // Attachments → Vision + note
   let attachmentNote = "";
   const imageMessages = [];
   const limitedAttachments = attachments.slice(0, MAX_ATTACHMENTS);
@@ -447,7 +503,24 @@ module.exports = async (req, res) => {
     coachProfile
   );
 
-  const messages = [{ role: "system", content: systemPrompt }, ...historyMessages];
+  // ---------- Automatic User Profile Summary ----------
+  const client = await getOpenAIClient();
+  const userProfileSummary = await buildUserProfileSummary(client, historyMessages);
+
+  const messages = [{ role: "system", content: systemPrompt }];
+
+  if (userProfileSummary) {
+    messages.push({
+      role: "system",
+      content:
+        "User profile summary based on the conversation so far (use this to keep recommendations consistent, and do NOT invent missing details):\n" +
+        userProfileSummary,
+    });
+  }
+
+  if (historyMessages.length > 0) {
+    messages.push(...historyMessages);
+  }
 
   if (attachmentNote) {
     messages.push({ role: "system", content: attachmentNote });
@@ -464,8 +537,6 @@ module.exports = async (req, res) => {
   messages.push({ role: "user", content: lastUserContent });
 
   try {
-    const client = await getOpenAIClient();
-
     const completion = await client.chat.completions.create({
       model: DEFAULT_MODEL,
       messages,
