@@ -1,11 +1,15 @@
 // ======================================================================
 // EXERBUD AI — NON-STREAMING BACKEND
 // - Google Search (optional)
-// - PDF Export
+// - PDF Export (with logo, no visible title text)
 // - Vision support via attachments (image_url)
 // ======================================================================
 
 const fetch = require("node-fetch");
+
+// Logo URL for PDF header
+const EXERBUD_LOGO_URL =
+  "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
 
 // ----------------------------------------------
 // Main handler (WITH CORS)
@@ -33,26 +37,51 @@ module.exports = async function handler(req, res) {
     const body = req.body || {};
 
     // ==========================================================
-    //  PDF EXPORT MODE
+    //  PDF EXPORT MODE (UPDATED: LOGO + NO VISIBLE TITLE TEXT)
     // ==========================================================
     if (body.pdfExport) {
       const planText = body.planText || "Your workout plan";
-      const title = body.planTitle || "Exerbud workout plan";
+      // We ignore body.planTitle for PDF content, and we don't show
+      // "Exerbud workout plan" anywhere inside the PDF.
 
       const PDFDocument = require("pdfkit");
       const doc = new PDFDocument({ margin: 40 });
 
+      // Fixed filename so "Exerbud workout plan" doesn't appear there either
+      const filename = "exerbud-plan.pdf";
+
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="${title.replace(/[^a-z0-9_\-]/gi, "_")}.pdf"`
+        `attachment; filename="${filename}"`
       );
 
+      // Pipe PDF stream to response
       doc.pipe(res);
 
-      doc.fontSize(20).text(title, { align: "left" });
-      doc.moveDown();
+      // Try to fetch and draw the logo at the top (centered)
+      try {
+        const logoRes = await fetch(EXERBUD_LOGO_URL);
+        if (logoRes.ok) {
+          const logoBuffer = await logoRes.buffer();
 
+          // Draw logo at the top, centered, with a reasonable size
+          doc.image(logoBuffer, {
+            fit: [80, 80],
+            align: "center",
+            valign: "top",
+          });
+
+          // Add some vertical space after the logo
+          doc.moveDown(2);
+        }
+      } catch (logoErr) {
+        console.error("PDF logo fetch/embedding error:", logoErr);
+        // If logo fails, just continue with text — no title text either.
+        doc.moveDown(1);
+      }
+
+      // Now write the plan text only (no big title)
       doc.fontSize(12);
       const paragraphs = String(planText).split(/\n{2,}/);
 
