@@ -1,7 +1,7 @@
 // ======================================================================
 // EXERBUD AI — NON-STREAMING BACKEND
 // - Google Search (optional)
-// - PDF Export (with logo, no visible title text)
+// - PDF Export (with centered logo, no visible title text)
 // - Vision support via attachments (image_url)
 // ======================================================================
 
@@ -27,7 +27,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Only POST allowed for real operations
+  // Only POST allowed
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST, OPTIONS");
     return res.status(405).json({ error: "Method not allowed" });
@@ -37,17 +37,14 @@ module.exports = async function handler(req, res) {
     const body = req.body || {};
 
     // ==========================================================
-    //  PDF EXPORT MODE (UPDATED: LOGO + NO VISIBLE TITLE TEXT)
+    //  PDF EXPORT MODE (LOGO CENTERED)
     // ==========================================================
     if (body.pdfExport) {
-      const planText = body.planText || "Your workout plan";
-      // We ignore body.planTitle for PDF content, and we don't show
-      // "Exerbud workout plan" anywhere inside the PDF.
+      const planText = body.planText || "";
 
       const PDFDocument = require("pdfkit");
       const doc = new PDFDocument({ margin: 40 });
 
-      // Fixed filename so "Exerbud workout plan" doesn't appear there either
       const filename = "exerbud-plan.pdf";
 
       res.setHeader("Content-Type", "application/pdf");
@@ -56,39 +53,48 @@ module.exports = async function handler(req, res) {
         `attachment; filename="${filename}"`
       );
 
-      // Pipe PDF stream to response
       doc.pipe(res);
 
-      // Try to fetch and draw the logo at the top (centered)
+      // -------- CENTERED LOGO HEADER ----------
       try {
         const logoRes = await fetch(EXERBUD_LOGO_URL);
         if (logoRes.ok) {
           const logoBuffer = await logoRes.buffer();
 
-          // Draw logo at the top, centered, with a reasonable size
-          doc.image(logoBuffer, {
-            fit: [80, 80],
-            align: "center",
-            valign: "top",
+          // Measure the page
+          const pageWidth = doc.page.width;
+
+          // Desired rendered width
+          const renderWidth = 90; // adjust if needed (80–120 recommended)
+          const image = doc.openImage(logoBuffer);
+
+          const scale = renderWidth / image.width;
+          const renderHeight = image.height * scale;
+
+          const x = (pageWidth - renderWidth) / 2; // <-- CENTERED
+          const y = 30; // top margin
+
+          doc.image(logoBuffer, x, y, {
+            width: renderWidth,
+            height: renderHeight,
           });
 
-          // Add some vertical space after the logo
-          doc.moveDown(2);
+          // Add space below logo
+          doc.moveDown(4);
         }
-      } catch (logoErr) {
-        console.error("PDF logo fetch/embedding error:", logoErr);
-        // If logo fails, just continue with text — no title text either.
+      } catch (err) {
+        console.error("Error embedding PDF logo:", err);
         doc.moveDown(1);
       }
 
-      // Now write the plan text only (no big title)
+      // -------- PDF BODY TEXT ----------
       doc.fontSize(12);
+
       const paragraphs = String(planText).split(/\n{2,}/);
 
       paragraphs.forEach((para, index) => {
         const clean = para.trim();
         if (!clean) return;
-
         doc.text(clean);
         if (index < paragraphs.length - 1) doc.moveDown();
       });
@@ -108,13 +114,12 @@ module.exports = async function handler(req, res) {
     const enableSearch = Boolean(body.enableSearch);
     const coachProfile = body.coachProfile || null;
 
-    // Allow bare-image messages (no text) as long as we have attachments
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
     }
 
     // ----------------------------------------------------------
-    // Prepare conversation history
+    // Prepare formatted history
     // ----------------------------------------------------------
     const formattedHistory = history.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
@@ -124,31 +129,28 @@ module.exports = async function handler(req, res) {
     const messages = [...formattedHistory];
 
     // ----------------------------------------------------------
-    // SYSTEM PROMPT (with coach profile)
+    // SYSTEM PROMPT
     // ----------------------------------------------------------
     let systemPrompt =
       "You are Exerbud, a helpful fitness and strength training coach. " +
       "Give clear, practical, sustainable advice. Avoid markdown headings (#). " +
-      "Bullet points are okay. Keep formatting clean and readable.";
+      "Bullet points and short paragraphs only.";
 
     if (coachProfile === "strength") {
-      systemPrompt += " You focus on strength training and compound lifts.";
+      systemPrompt += " You focus on strength and compound lifts.";
     } else if (coachProfile === "hypertrophy") {
-      systemPrompt +=
-        " You focus on hypertrophy and muscle-building programming.";
+      systemPrompt += " You focus on hypertrophy and muscle growth.";
     } else if (coachProfile === "mobility") {
-      systemPrompt +=
-        " You focus on mobility, joint health, and pain-free movement.";
+      systemPrompt += " You focus on mobility and joint quality.";
     } else if (coachProfile === "fat_loss") {
-      systemPrompt +=
-        " You focus on sustainable fat loss while preserving muscle.";
+      systemPrompt += " You focus on sustainable fat loss.";
     }
 
     messages.unshift({
       role: "system",
       content:
         systemPrompt +
-        " If you produce workout schedules, format them cleanly using plain text and bullet points. No markdown headers.",
+        " Keep formatting clean and readable. No markdown headers.",
     });
 
     // ==========================================================
@@ -172,41 +174,33 @@ module.exports = async function handler(req, res) {
 
         const searchRes = await fetch(url.toString());
         if (searchRes.ok) {
-          const searchData = await searchRes.json();
-          if (searchData.items?.length) {
-            const snippets = searchData.items
+          const data = await searchRes.json();
+          if (data.items?.length) {
+            const snippets = data.items
               .slice(0, 5)
               .map((item, i) => {
-                const title = item.title || "";
-                const snippet = item.snippet || "";
-                const link = item.link || "";
-                return `${i + 1}. ${title}\n${snippet}\n${link}`;
+                return `${i + 1}. ${item.title || ""}\n${
+                  item.snippet || ""
+                }\n${item.link || ""}`;
               })
               .join("\n\n");
 
             toolResultsText =
               "Search results:\n\n" +
               snippets +
-              "\n\nUse this as context, but write your answer naturally. Do not explicitly mention these results.";
+              "\n\nUse this only as context for better answers. Do not mention them directly.";
           }
         }
       } catch (err) {
-        console.error("Google Search Error:", err);
+        console.error("Search error:", err);
       }
     }
 
     // ==========================================================
-    // Attachments: split image vs other
+    // Attachments: images vs other files
     // ==========================================================
     const imageAttachments = attachments.filter(
-      (f) =>
-        f &&
-        typeof f === "object" &&
-        f.data &&
-        typeof f.data === "string" &&
-        f.type &&
-        typeof f.type === "string" &&
-        f.type.startsWith("image/")
+      (f) => f?.type?.startsWith("image/") && typeof f.data === "string"
     );
 
     const otherAttachments = attachments.filter(
@@ -214,7 +208,7 @@ module.exports = async function handler(req, res) {
     );
 
     // ----------------------------------------------------------
-    // Build augmented user message (text)
+    // Build textual user message
     // ----------------------------------------------------------
     let augmentedUserMessage = message || "";
 
@@ -223,17 +217,14 @@ module.exports = async function handler(req, res) {
         (augmentedUserMessage ? "\n\n" : "") +
         "[Search Context]\n\n" +
         toolResultsText +
-        "\n\n(Do not mention this bracketed text explicitly.)";
+        "\n\n(Do not mention this context explicitly.)";
     }
 
     if (otherAttachments.length) {
       const fileLines = otherAttachments.map((f) => {
-        const name = (f && f.name) || "file";
-        const type = (f && f.type) || "unknown";
-        const sizeKB =
-          f && typeof f.size === "number"
-            ? Math.round(f.size / 1024)
-            : "unknown";
+        const name = f.name || "file";
+        const type = f.type || "unknown";
+        const sizeKB = f.size ? Math.round(f.size / 1024) : "unknown";
         return `- ${name} (${type}, ~${sizeKB} KB)`;
       });
 
@@ -244,7 +235,7 @@ module.exports = async function handler(req, res) {
     }
 
     // ----------------------------------------------------------
-    // Build user content (text + optional images)
+    // Build userMessage content with images
     // ----------------------------------------------------------
     let userContent;
 
@@ -260,34 +251,24 @@ module.exports = async function handler(req, res) {
 
       for (const img of imageAttachments) {
         const mime = img.type || "image/jpeg";
-        const base64 = img.data;
         parts.push({
           type: "image_url",
-          image_url: {
-            url: `data:${mime};base64,${base64}`,
-          },
+          image_url: { url: `data:${mime};base64,${img.data}` },
         });
       }
 
       userContent = parts;
     } else {
-      // No images → plain text message
       userContent = augmentedUserMessage || " ";
     }
 
-    messages.push({
-      role: "user",
-      content: userContent,
-    });
+    messages.push({ role: "user", content: userContent });
 
     // ==========================================================
-    // OPENAI COMPLETION (VISION-CAPABLE MODEL)
+    // OPENAI RESPONSE
     // ==========================================================
     const OpenAI = (await import("openai")).default;
-
-    const client = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const model = process.env.EXERBUD_MODEL || "gpt-4.1";
 
@@ -300,7 +281,7 @@ module.exports = async function handler(req, res) {
 
     const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
-      "I’m sorry — I wasn’t able to generate a response.";
+      "I'm sorry — I couldn't generate a response.";
 
     return res.status(200).json({ reply });
   } catch (error) {
