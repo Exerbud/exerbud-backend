@@ -129,28 +129,42 @@ module.exports = async function handler(req, res) {
     const messages = [...formattedHistory];
 
     // ----------------------------------------------------------
-    // SYSTEM PROMPT
+    // SYSTEM PROMPT (WITH WEB SEARCH BEHAVIOR)
     // ----------------------------------------------------------
-    let systemPrompt =
-      "You are Exerbud, a helpful fitness and strength training coach. " +
-      "Give clear, practical, sustainable advice. Avoid markdown headings (#). " +
-      "Bullet points and short paragraphs only.";
+    let systemPrompt = `
+You are Exerbud AI — an expert fitness, strength, hypertrophy, mobility, and nutrition coach embedded on the Exerbud website.
+
+You:
+- Give clear, practical, sustainable advice.
+- Prefer short paragraphs and bullet points.
+- Avoid markdown headings like "#" in your responses.
+
+You may sometimes receive extra context that includes live web search results, clearly labeled in the user message (for example with tags like [WEB SEARCH RESULTS]).
+Treat this as information retrieved from the internet and use it to improve your answers.
+
+Very important:
+- Do NOT say things like "I cannot browse the internet" or "I don't have access to the web."
+- If the user asks whether you can search the internet, respond naturally that you can pull in up-to-date information from the web when it's helpful and combine it with your general fitness and nutrition knowledge.
+- Do not mention internal labels like [WEB SEARCH RESULTS], [Search Context], or "tools" in your replies — just answer as if you already knew the information.
+
+Formatting:
+- No markdown headers.
+- Use bullet points and short, scannable sections.
+`;
 
     if (coachProfile === "strength") {
-      systemPrompt += " You focus on strength and compound lifts.";
+      systemPrompt += " You focus more on strength and compound lifts.";
     } else if (coachProfile === "hypertrophy") {
-      systemPrompt += " You focus on hypertrophy and muscle growth.";
+      systemPrompt += " You focus more on hypertrophy and muscle growth.";
     } else if (coachProfile === "mobility") {
-      systemPrompt += " You focus on mobility and joint quality.";
+      systemPrompt += " You focus more on mobility and joint quality.";
     } else if (coachProfile === "fat_loss") {
-      systemPrompt += " You focus on sustainable fat loss.";
+      systemPrompt += " You focus more on sustainable fat loss.";
     }
 
     messages.unshift({
       role: "system",
-      content:
-        systemPrompt +
-        " Keep formatting clean and readable. No markdown headers.",
+      content: systemPrompt,
     });
 
     // ==========================================================
@@ -172,6 +186,8 @@ module.exports = async function handler(req, res) {
         url.searchParams.set("cx", process.env.GOOGLE_CX);
         url.searchParams.set("q", query);
 
+        console.log("[Exerbud] Performing web search for query:", query);
+
         const searchRes = await fetch(url.toString());
         if (searchRes.ok) {
           const data = await searchRes.json();
@@ -185,11 +201,13 @@ module.exports = async function handler(req, res) {
               })
               .join("\n\n");
 
-            toolResultsText =
-              "Search results:\n\n" +
-              snippets +
-              "\n\nUse this only as context for better answers. Do not mention them directly.";
+            toolResultsText = snippets;
           }
+        } else {
+          console.warn(
+            "[Exerbud] Google search HTTP status:",
+            searchRes.status
+          );
         }
       } catch (err) {
         console.error("Search error:", err);
@@ -208,16 +226,17 @@ module.exports = async function handler(req, res) {
     );
 
     // ----------------------------------------------------------
-    // Build textual user message
+    // Build textual user message (INCLUDING WEB RESULTS)
     // ----------------------------------------------------------
     let augmentedUserMessage = message || "";
 
     if (toolResultsText) {
       augmentedUserMessage +=
         (augmentedUserMessage ? "\n\n" : "") +
-        "[Search Context]\n\n" +
+        "[WEB SEARCH RESULTS]\n\n" +
         toolResultsText +
-        "\n\n(Do not mention this context explicitly.)";
+        "\n\n[END OF WEB SEARCH RESULTS]\n\n" +
+        "(Use this background information to give a better answer, but do not mention that you saw search results.)";
     }
 
     if (otherAttachments.length) {
