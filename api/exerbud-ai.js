@@ -3,6 +3,7 @@
 // - Google Search (optional)
 // - PDF Export (with centered logo, no visible title text)
 // - Vision support via attachments (image_url)
+// - User Identity (Shopify → Backend)
 // ======================================================================
 
 const fetch = require("node-fetch");
@@ -55,31 +56,20 @@ module.exports = async function handler(req, res) {
 
       doc.pipe(res);
 
-      // -------- CENTERED LOGO HEADER ----------
+      // --- Centered Logo ---
       try {
         const logoRes = await fetch(EXERBUD_LOGO_URL);
         if (logoRes.ok) {
-          const logoBuffer = await logoRes.buffer();
-
-          // Measure the page
+          const buf = await logoRes.buffer();
           const pageWidth = doc.page.width;
+          const desiredWidth = 90;
+          const img = doc.openImage(buf);
+          const scale = desiredWidth / img.width;
+          const renderedHeight = img.height * scale;
+          const x = (pageWidth - desiredWidth) / 2;
+          const y = 30;
 
-          // Desired rendered width
-          const renderWidth = 90; // adjust if needed (80–120 recommended)
-          const image = doc.openImage(logoBuffer);
-
-          const scale = renderWidth / image.width;
-          const renderHeight = image.height * scale;
-
-          const x = (pageWidth - renderWidth) / 2; // <-- CENTERED
-          const y = 30; // top margin
-
-          doc.image(logoBuffer, x, y, {
-            width: renderWidth,
-            height: renderHeight,
-          });
-
-          // Add space below logo
+          doc.image(buf, x, y, { width: desiredWidth, height: renderedHeight });
           doc.moveDown(4);
         }
       } catch (err) {
@@ -87,16 +77,15 @@ module.exports = async function handler(req, res) {
         doc.moveDown(1);
       }
 
-      // -------- PDF BODY TEXT ----------
+      // --- Body text ---
       doc.fontSize(12);
-
       const paragraphs = String(planText).split(/\n{2,}/);
 
-      paragraphs.forEach((para, index) => {
-        const clean = para.trim();
+      paragraphs.forEach((p, i) => {
+        const clean = p.trim();
         if (!clean) return;
         doc.text(clean);
-        if (index < paragraphs.length - 1) doc.moveDown();
+        if (i < paragraphs.length - 1) doc.moveDown();
       });
 
       doc.end();
@@ -106,66 +95,61 @@ module.exports = async function handler(req, res) {
     // ==========================================================
     //  NORMAL CHAT REQUEST
     // ==========================================================
-    const message = (body.message || "").toString().trim();
+    const message = (body.message || "").trim();
     const history = Array.isArray(body.history) ? body.history : [];
-    const attachments = Array.isArray(body.attachments)
-      ? body.attachments
-      : [];
+    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
     const enableSearch = Boolean(body.enableSearch);
     const coachProfile = body.coachProfile || null;
+
+    // 👉 NEW: User identity forwarded from frontend
+    const userId = body.userId || null;
+    const userEmail = body.userEmail || null;
+
+    console.log("[Exerbud] Request from:", { userId, userEmail });
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
     }
 
     // ----------------------------------------------------------
-    // Prepare formatted history
+    // Prepare formatted history for OpenAI
     // ----------------------------------------------------------
     const formattedHistory = history.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
-      content: (m.content || "").toString().slice(0, 4000),
+      content: String(m.content || "").slice(0, 4000),
     }));
 
     const messages = [...formattedHistory];
 
     // ----------------------------------------------------------
-    // SYSTEM PROMPT (WITH WEB SEARCH BEHAVIOR)
+    // SYSTEM PROMPT (improved)
     // ----------------------------------------------------------
     let systemPrompt = `
-You are Exerbud AI — an expert fitness, strength, hypertrophy, mobility, and nutrition coach embedded on the Exerbud website.
+You are Exerbud AI — an expert fitness, strength, hypertrophy, mobility, and nutrition coach.
 
-You:
-- Give clear, practical, sustainable advice.
-- Prefer short paragraphs and bullet points.
-- Avoid markdown headings like "#" in your responses.
-
-You may sometimes receive extra context that includes live web search results, clearly labeled in the user message (for example with tags like [WEB SEARCH RESULTS]).
-Treat this as information retrieved from the internet and use it to improve your answers.
-
-Very important:
-- Do NOT say things like "I cannot browse the internet" or "I don't have access to the web."
-- If the user asks whether you can search the internet, respond naturally that you can pull in up-to-date information from the web when it's helpful and combine it with your general fitness and nutrition knowledge.
-- Do not mention internal labels like [WEB SEARCH RESULTS], [Search Context], or "tools" in your replies — just answer as if you already knew the information.
-
-Formatting:
-- No markdown headers.
-- Use bullet points and short, scannable sections.
+RULES:
+- You always respond in clear, practical, friendly language.
+- Use short paragraphs and bullet points.
+- No markdown headers (“# Title”).
+- You *can* incorporate information from web search results.
+- You *never* say “I cannot browse the internet.”
+- You *never* mention [WEB SEARCH RESULTS] or internal formatting.
+- You behave consistently across sessions, especially for known users.
 `;
 
-    if (coachProfile === "strength") {
-      systemPrompt += " You focus more on strength and compound lifts.";
-    } else if (coachProfile === "hypertrophy") {
-      systemPrompt += " You focus more on hypertrophy and muscle growth.";
-    } else if (coachProfile === "mobility") {
-      systemPrompt += " You focus more on mobility and joint quality.";
-    } else if (coachProfile === "fat_loss") {
-      systemPrompt += " You focus more on sustainable fat loss.";
+    if (coachProfile === "strength") systemPrompt += " Coaching mode: Strength focus.";
+    else if (coachProfile === "hypertrophy") systemPrompt += " Coaching mode: Muscle growth focus.";
+    else if (coachProfile === "mobility") systemPrompt += " Coaching mode: Mobility & movement quality.";
+    else if (coachProfile === "fat_loss") systemPrompt += " Coaching mode: Sustainable fat loss.";
+
+    // 👉 NEW: User identity awareness
+    if (userId) {
+      systemPrompt += ` You are speaking to the same returning user: ${userId}. Maintain consistency and support long-term tracking.`;
+    } else {
+      systemPrompt += " This may be a guest user with no persistent identity.";
     }
 
-    messages.unshift({
-      role: "system",
-      content: systemPrompt,
-    });
+    messages.unshift({ role: "system", content: systemPrompt });
 
     // ==========================================================
     // GOOGLE SEARCH (OPTIONAL)
@@ -186,28 +170,22 @@ Formatting:
         url.searchParams.set("cx", process.env.GOOGLE_CX);
         url.searchParams.set("q", query);
 
-        console.log("[Exerbud] Performing web search for query:", query);
+        console.log("[Exerbud] Searching:", query);
 
         const searchRes = await fetch(url.toString());
+
         if (searchRes.ok) {
           const data = await searchRes.json();
-          if (data.items?.length) {
-            const snippets = data.items
-              .slice(0, 5)
-              .map((item, i) => {
-                return `${i + 1}. ${item.title || ""}\n${
-                  item.snippet || ""
-                }\n${item.link || ""}`;
-              })
-              .join("\n\n");
 
-            toolResultsText = snippets;
+          if (data.items?.length) {
+            toolResultsText = data.items
+              .slice(0, 5)
+              .map(
+                (item, i) =>
+                  `${i + 1}. ${item.title || ""}\n${item.snippet || ""}\n${item.link || ""}`
+              )
+              .join("\n\n");
           }
-        } else {
-          console.warn(
-            "[Exerbud] Google search HTTP status:",
-            searchRes.status
-          );
         }
       } catch (err) {
         console.error("Search error:", err);
@@ -215,58 +193,48 @@ Formatting:
     }
 
     // ==========================================================
-    // Attachments: images vs other files
+    // Attachments → image & other types
     // ==========================================================
     const imageAttachments = attachments.filter(
       (f) => f?.type?.startsWith("image/") && typeof f.data === "string"
     );
-
     const otherAttachments = attachments.filter(
       (f) => !imageAttachments.includes(f)
     );
 
     // ----------------------------------------------------------
-    // Build textual user message (INCLUDING WEB RESULTS)
+    // Build user message
     // ----------------------------------------------------------
     let augmentedUserMessage = message || "";
 
     if (toolResultsText) {
       augmentedUserMessage +=
-        (augmentedUserMessage ? "\n\n" : "") +
-        "[WEB SEARCH RESULTS]\n\n" +
+        "\n\n[WEB SEARCH RESULTS]\n\n" +
         toolResultsText +
-        "\n\n[END OF WEB SEARCH RESULTS]\n\n" +
-        "(Use this background information to give a better answer, but do not mention that you saw search results.)";
+        "\n\n[END OF WEB SEARCH RESULTS]\n" +
+        "(Use this information silently but never mention search results.)";
     }
 
     if (otherAttachments.length) {
-      const fileLines = otherAttachments.map((f) => {
-        const name = f.name || "file";
-        const type = f.type || "unknown";
-        const sizeKB = f.size ? Math.round(f.size / 1024) : "unknown";
-        return `- ${name} (${type}, ~${sizeKB} KB)`;
-      });
-
       augmentedUserMessage +=
-        (augmentedUserMessage ? "\n\n" : "") +
-        "[Attached files]\n" +
-        fileLines.join("\n");
+        "\n\n[Attached files]\n" +
+        otherAttachments
+          .map((f) => {
+            const sizeKB = f.size ? Math.round(f.size / 1024) : "unknown";
+            return `- ${f.name || "file"} (${f.type || "unknown"}, ~${sizeKB} KB)`;
+          })
+          .join("\n");
     }
 
     // ----------------------------------------------------------
-    // Build userMessage content with images
+    // Build "content" for OpenAI (with image_url parts)
     // ----------------------------------------------------------
     let userContent;
 
     if (imageAttachments.length) {
       const parts = [];
 
-      if (augmentedUserMessage) {
-        parts.push({
-          type: "text",
-          text: augmentedUserMessage,
-        });
-      }
+      if (augmentedUserMessage) parts.push({ type: "text", text: augmentedUserMessage });
 
       for (const img of imageAttachments) {
         const mime = img.type || "image/jpeg";
@@ -284,7 +252,7 @@ Formatting:
     messages.push({ role: "user", content: userContent });
 
     // ==========================================================
-    // OPENAI RESPONSE
+    // OPENAI COMPLETION
     // ==========================================================
     const OpenAI = (await import("openai")).default;
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
