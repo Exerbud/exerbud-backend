@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "vercel dev",
     "start": "vercel dev",
-    "vercel-build": "echo \"No build step required\""
+    "vercel-build": "echo \"No build step required\"",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@prisma/client": "^7.0.1",
