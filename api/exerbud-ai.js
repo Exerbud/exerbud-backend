@@ -1,144 +1,16 @@
 // ======================================================================
-// EXERBUD AI — NON-STREAMING BACKEND WITH DB "MEMORY"
+// EXERBUD AI — MINIMAL NON-STREAMING BACKEND
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - Prisma persistence: Users / Conversations / Messages / Uploads
-// - Lightweight memory: last messages per user injected into prompt
-// - NO Google search
+// - NO Prisma / DB / Google search
 // ======================================================================
 
 const { randomUUID } = require("crypto");
-const { PrismaClient } = require("@prisma/client");
 
-let prisma = null;
-function getPrisma() {
-  if (!prisma) {
-    prisma = new PrismaClient();
-  }
-  return prisma;
-}
-
-// Logo URL for PDF header
+// Logo URL for PDF header (optional)
 const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
-
-// ----------------------------------------------
-// DB helpers
-// ----------------------------------------------
-
-async function getOrCreateUser({ externalId, email }) {
-  if (!externalId) return null;
-
-  const db = getPrisma();
-
-  const dataToUpdate = { lastSeenAt: new Date() };
-  if (email) dataToUpdate.email = email;
-
-  const user = await db.user.upsert({
-    where: { externalId },
-    create: {
-      externalId,
-      email: email || null,
-    },
-    update: dataToUpdate,
-  });
-
-  return user;
-}
-
-async function getOrCreateConversation({ user, conversationId, coachProfile, workflow }) {
-  if (!user) return null;
-  const db = getPrisma();
-
-  if (conversationId) {
-    try {
-      const existing = await db.conversation.findUnique({
-        where: { id: conversationId },
-      });
-      if (existing) return existing;
-    } catch (err) {
-      console.warn("[Exerbud] Failed to reuse conversation:", err?.message);
-    }
-  }
-
-  const convo = await db.conversation.create({
-    data: {
-      userId: user.id,
-      coachProfile: coachProfile || null,
-      workflow: workflow || null,
-      source: "shopify_widget",
-    },
-  });
-
-  return convo;
-}
-
-async function saveMessage({ conversation, user, role, content }) {
-  if (!conversation || !role || !content) return null;
-  const db = getPrisma();
-
-  return db.message.create({
-    data: {
-      conversationId: conversation.id,
-      userId: user ? user.id : null,
-      role,
-      content,
-    },
-  });
-}
-
-async function saveUploads({ conversation, user, attachments, workflow }) {
-  if (!conversation || !user || !attachments?.length) return;
-  const db = getPrisma();
-
-  const rows = attachments.map((a) => ({
-    userId: user.id,
-    conversationId: conversation.id,
-    url: "inline",
-    type: a.type || "unknown",
-    workflow: workflow || null,
-  }));
-
-  await db.upload.createMany({ data: rows });
-}
-
-/**
- * Load lightweight "memory" for this user:
- * last ~20 messages across conversations, turned into short text lines.
- */
-async function loadUserMemory(user) {
-  if (!user) return "";
-
-  try {
-    const db = getPrisma();
-
-    const msgs = await db.message.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: "desc" },
-      take: 20,
-    });
-
-    if (!msgs.length) return "";
-
-    const lines = msgs
-      .reverse() // oldest first
-      .map((m) => {
-        const who = m.role === "assistant" ? "Coach" : "User";
-        const text = (m.content || "").replace(/\s+/g, " ").slice(0, 200);
-        return `${who}: ${text}`;
-      });
-
-    return lines.join("\n");
-  } catch (err) {
-    console.warn("[Exerbud] Failed to load user memory:", err?.message);
-    return "";
-  }
-}
-
-// ----------------------------------------------
-// Main handler
-// ----------------------------------------------
 
 module.exports = async function handler(req, res) {
   // --- CORS (for Shopify widget) ---
@@ -152,7 +24,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Simple GET healthcheck
+    // Simple GET healthcheck so hitting the URL in a browser works
     if (req.method === "GET") {
       return res.status(200).json({
         ok: true,
@@ -165,11 +37,8 @@ module.exports = async function handler(req, res) {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // Ensure Prisma can init inside try/catch
-    getPrisma();
-
     // ------------------------------------------------------------------
-    // Body parsing (Vercel may give string)
+    // Body parsing (Vercel may give a string)
     // ------------------------------------------------------------------
     let body = req.body;
     if (typeof body === "string") {
@@ -254,43 +123,18 @@ module.exports = async function handler(req, res) {
       : [];
 
     const coachProfile = body.coachProfile || null;
+    // We still accept workflow, but don’t *need* it for the model logic
     const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
 
-    const conversationIdFromClient = body.conversationId || null;
-    const rawExternalId =
-      body.userExternalId || body.externalId || null;
-    const email = body.userEmail || body.email || null;
-
-    // stable externalId used for DB User row
-    const externalId =
-      rawExternalId ||
-      `guest:${body.clientId || body.sessionId || randomUUID().toString().slice(0, 12)}`;
+    const conversationId = body.conversationId || null;
+    const userExternalId = body.userExternalId || null;
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
     }
 
     // ------------------------------------------------------------------
-    // DB: User + Conversation + attachments
-    // ------------------------------------------------------------------
-    const user = await getOrCreateUser({ externalId, email });
-    const conversation = await getOrCreateConversation({
-      user,
-      conversationId: conversationIdFromClient,
-      coachProfile,
-      workflow,
-    });
-
-    if (conversation && user && attachments.length) {
-      try {
-        await saveUploads({ conversation, user, attachments, workflow });
-      } catch (e) {
-        console.warn("[Exerbud] Failed to save uploads:", e?.message);
-      }
-    }
-
-    // ------------------------------------------------------------------
-    // Format history for OpenAI
+    // Format history for OpenAI (strip timestamps etc.)
     // ------------------------------------------------------------------
     const formattedHistory = history.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
@@ -298,10 +142,8 @@ module.exports = async function handler(req, res) {
     }));
 
     // ------------------------------------------------------------------
-    // Load DB "memory" and build system prompt
+    // System prompt (light coach style hints)
     // ------------------------------------------------------------------
-    const memoryContext = await loadUserMemory(user);
-
     let systemPrompt = `
 You are Exerbud AI, an expert fitness, strength, hypertrophy, mobility, and nutrition coach embedded on the Exerbud website.
 
@@ -310,7 +152,7 @@ General behavior:
 - Prefer short paragraphs and bullet points.
 - Keep tone friendly and encouraging.
 - Avoid markdown headings like "#", just use plain text and bullets.
-`.trim();
+    `.trim();
 
     if (coachProfile === "strength") {
       systemPrompt += " You focus more on strength training and compound lifts.";
@@ -320,15 +162,6 @@ General behavior:
       systemPrompt += " You focus more on mobility and joint quality.";
     } else if (coachProfile === "fat_loss") {
       systemPrompt += " You focus more on sustainable fat loss.";
-    }
-
-    if (memoryContext) {
-      systemPrompt += `
-
-Here is prior history for this user from previous sessions (messages from both you and the user). Use it to maintain continuity, remember preferences, and reference earlier advice — but do NOT mention databases, storage, or that this was loaded from "memory":
-
-${memoryContext}
-`;
     }
 
     const messages = [
@@ -387,25 +220,6 @@ ${memoryContext}
     messages.push({ role: "user", content: userContent });
 
     // ------------------------------------------------------------------
-    // Save user message (for memory) before calling OpenAI
-    // ------------------------------------------------------------------
-    const rawUserContentForDB =
-      message || (attachments.length ? "[attachments]" : "");
-
-    if (conversation && rawUserContentForDB) {
-      try {
-        await saveMessage({
-          conversation,
-          user,
-          role: "user",
-          content: rawUserContentForDB,
-        });
-      } catch (e) {
-        console.warn("[Exerbud] Failed to save user message:", e?.message);
-      }
-    }
-
-    // ------------------------------------------------------------------
     // OpenAI call
     // ------------------------------------------------------------------
     const OpenAI = (await import("openai")).default;
@@ -420,28 +234,14 @@ ${memoryContext}
       max_tokens: 900,
     });
 
-    const replyText =
+    const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
 
-    // Save assistant reply (without any extra processing)
-    if (conversation && replyText) {
-      try {
-        await saveMessage({
-          conversation,
-          user: null,
-          role: "assistant",
-          content: replyText,
-        });
-      } catch (e) {
-        console.warn("[Exerbud] Failed to save assistant message:", e?.message);
-      }
-    }
-
     return res.status(200).json({
-      reply: replyText,
-      conversationId: conversation ? conversation.id : conversationIdFromClient || randomUUID(),
-      userExternalId: externalId,
+      reply,
+      conversationId: conversationId || randomUUID(),
+      userExternalId: userExternalId || randomUUID(),
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);
