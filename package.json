@@ -4,8 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "vercel dev",
-    "start": "vercel dev",
-    "vercel-build": "prisma generate",
+    "build": "prisma generate",
     "postinstall": "prisma generate"
   },
   "dependencies": {
