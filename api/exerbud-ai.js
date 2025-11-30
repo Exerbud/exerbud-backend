@@ -190,7 +190,7 @@ module.exports = async function handler(req, res) {
   // --- GLOBAL CORS HEADERS (REQUIRED FOR SHOPIFY) ---
   //
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   // Preflight
@@ -198,9 +198,17 @@ module.exports = async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Only POST allowed
+  // Simple health-check / browser GET
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: true,
+      message: "Exerbud AI backend is alive",
+    });
+  }
+
+  // Only POST allowed for real work
   if (req.method !== "POST") {
-    res.setHeader("Allow", "POST, OPTIONS");
+    res.setHeader("Allow", "GET, POST, OPTIONS");
     return res.status(405).json({ error: "Method not allowed" });
   }
 
