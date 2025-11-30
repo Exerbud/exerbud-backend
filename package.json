@@ -9,14 +9,13 @@
   },
   "dependencies": {
     "@prisma/client": "^7.0.1",
-    "prisma": "^7.0.1",           // ⬅️ moved here
+    "prisma": "^7.0.1",
     "@vercel/blob": "^2.0.0",
     "axios": "^1.6.0",
     "openai": "^4.104.0",
     "pdfkit": "^0.17.2"
   },
-  "devDependencies": {
-    // (can be empty, or remove this block entirely)
-  }
+  "devDependencies": {}
 }
+
 
