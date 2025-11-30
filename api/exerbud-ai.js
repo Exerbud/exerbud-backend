@@ -1,21 +1,30 @@
 // ======================================================================
-// EXERBUD AI — NON-STREAMING BACKEND (WITH BASIC DB MEMORY)
+// EXERBUD AI — BACKEND WITH OPTIONAL PRISMA MEMORY
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - Prisma DB for User / Conversation / Message
+// - OPTIONAL Prisma DB for User / Conversation / Message
+//   (if Prisma fails, we gracefully fall back to stateless mode)
 // ======================================================================
 
 const { randomUUID } = require("crypto");
-const { PrismaClient } = require("@prisma/client");
 
-// ---------- Prisma (lazy init so cold starts don't explode) ----------
+// ---------- Optional Prisma setup ----------
+let PrismaClient = null;
 let prisma = null;
+let dbAvailable = false;
+
+try {
+  // Will throw if @prisma/client isn't installed or can't init
+  PrismaClient = require("@prisma/client").PrismaClient;
+  prisma = new PrismaClient();
+  dbAvailable = true;
+} catch (e) {
+  console.warn("[Exerbud] Prisma not available, running without DB:", e.message);
+}
+
 function getPrisma() {
-  if (!prisma) {
-    prisma = new PrismaClient();
-  }
-  return prisma;
+  return dbAvailable ? prisma : null;
 }
 
 // ---------- Logo URL for PDF header (optional) ----------
@@ -23,26 +32,31 @@ const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
 
 // ======================================================================
-// DB HELPERS (match your previous schema: user / conversation / message)
+// DB HELPERS (best-effort; no-ops if Prisma unavailable)
 // ======================================================================
 
 async function getOrCreateUser({ externalId, email }) {
-  if (!externalId) return null;
-
   const db = getPrisma();
+  if (!db || !externalId) return null;
+
   const dataToUpdate = { lastSeenAt: new Date() };
   if (email) dataToUpdate.email = email;
 
-  const user = await db.user.upsert({
-    where: { externalId },
-    create: {
-      externalId,
-      email: email || null,
-    },
-    update: dataToUpdate,
-  });
-
-  return user;
+  try {
+    const user = await db.user.upsert({
+      where: { externalId },
+      create: {
+        externalId,
+        email: email || null,
+      },
+      update: dataToUpdate,
+    });
+    return user;
+  } catch (e) {
+    console.warn("[Exerbud] getOrCreateUser failed, disabling DB:", e.message);
+    dbAvailable = false;
+    return null;
+  }
 }
 
 async function getOrCreateConversation({
@@ -51,46 +65,51 @@ async function getOrCreateConversation({
   coachProfile,
   workflow,
 }) {
-  if (!user) return null;
   const db = getPrisma();
+  if (!db || !user) return null;
 
-  // Try to reuse an existing conversation if ID is provided
-  if (conversationId) {
-    try {
+  try {
+    if (conversationId) {
       const existing = await db.conversation.findUnique({
         where: { id: conversationId },
       });
       if (existing) return existing;
-    } catch (err) {
-      console.warn("[Exerbud] Failed to reuse conversation:", err?.message);
     }
+
+    const convo = await db.conversation.create({
+      data: {
+        userId: user.id,
+        coachProfile: coachProfile || null,
+        workflow: workflow || null,
+        source: "shopify_widget",
+      },
+    });
+    return convo;
+  } catch (e) {
+    console.warn("[Exerbud] getOrCreateConversation failed, disabling DB:", e.message);
+    dbAvailable = false;
+    return null;
   }
-
-  // Otherwise, create a new conversation
-  const convo = await db.conversation.create({
-    data: {
-      userId: user.id,
-      coachProfile: coachProfile || null,
-      workflow: workflow || null,
-      source: "shopify_widget",
-    },
-  });
-
-  return convo;
 }
 
 async function saveMessage({ conversation, user, role, content }) {
-  if (!conversation || !role || !content) return null;
-
   const db = getPrisma();
-  return db.message.create({
-    data: {
-      conversationId: conversation.id,
-      userId: user ? user.id : null,
-      role,
-      content,
-    },
-  });
+  if (!db || !conversation || !role || !content) return null;
+
+  try {
+    return await db.message.create({
+      data: {
+        conversationId: conversation.id,
+        userId: user ? user.id : null,
+        role,
+        content,
+      },
+    });
+  } catch (e) {
+    console.warn("[Exerbud] saveMessage failed, disabling DB:", e.message);
+    dbAvailable = false;
+    return null;
+  }
 }
 
 // ======================================================================
@@ -214,14 +233,14 @@ module.exports = async function handler(req, res) {
     const rawExternalId = body.userExternalId || body.externalId || null;
     const userEmail = body.userEmail || body.email || null;
 
-    // Fallback external ID so DB can still track anonymous users
-    const externalId =
-      rawExternalId ||
-      `guest:${body.clientId || body.sessionId || randomUUID().toString().slice(0, 12)}`;
-
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
     }
+
+    // Fallback external ID (used if DB is available)
+    const externalId =
+      rawExternalId ||
+      `guest:${body.clientId || body.sessionId || randomUUID().toString().slice(0, 12)}`;
 
     // ------------------------------------------------------------------
     // Format history for OpenAI (strip timestamps etc.)
@@ -310,32 +329,30 @@ General behavior:
     messages.push({ role: "user", content: userContent });
 
     // ------------------------------------------------------------------
-    // DB: ensure User + Conversation + store user message
+    // DB: ensure User + Conversation + store user message (best effort)
     // ------------------------------------------------------------------
-    // Only touch Prisma in the chat path (not PDF / GET)
-    getPrisma();
+    let user = null;
+    let conversation = null;
 
-    const user = await getOrCreateUser({ externalId, email: userEmail });
-    const conversation = await getOrCreateConversation({
-      user,
-      conversationId: incomingConversationId,
-      coachProfile,
-      workflow,
-    });
+    if (dbAvailable) {
+      user = await getOrCreateUser({ externalId, email: userEmail });
+      conversation = await getOrCreateConversation({
+        user,
+        conversationId: incomingConversationId,
+        coachProfile,
+        workflow,
+      });
 
-    const rawUserContentForDB =
-      message || (attachments.length ? "[attachments]" : "");
+      const rawUserContentForDB =
+        message || (attachments.length ? "[attachments]" : "");
 
-    if (conversation && rawUserContentForDB) {
-      try {
+      if (conversation && rawUserContentForDB) {
         await saveMessage({
           conversation,
           user,
           role: "user",
           content: rawUserContentForDB,
         });
-      } catch (e) {
-        console.warn("[Exerbud] Failed to save user message:", e?.message);
       }
     }
 
@@ -358,27 +375,23 @@ General behavior:
       completion.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
 
-    // Save assistant message to DB as well
-    if (conversation && reply) {
-      try {
-        await saveMessage({
-          conversation,
-          user: null,
-          role: "assistant",
-          content: reply,
-        });
-      } catch (e) {
-        console.warn(
-          "[Exerbud] Failed to save assistant message:",
-          e?.message
-        );
-      }
+    // Save assistant message to DB as well (if available)
+    if (dbAvailable && conversation && reply) {
+      await saveMessage({
+        conversation,
+        user: null,
+        role: "assistant",
+        content: reply,
+      });
     }
 
     return res.status(200).json({
       reply,
-      conversationId: conversation ? conversation.id : incomingConversationId || randomUUID(),
-      userExternalId: externalId,
+      conversationId:
+        (conversation && conversation.id) ||
+        incomingConversationId ||
+        randomUUID(),
+      userExternalId: dbAvailable ? externalId : (rawExternalId || randomUUID()),
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);
