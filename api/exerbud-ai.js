@@ -3,9 +3,7 @@
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - OPTIONAL Prisma persistence (users, conversations, messages)
-//   • If Prisma/@prisma/client or DATABASE_URL is missing, it just logs a
-//     warning and runs WITHOUT saving anything.
+// - Optional Prisma persistence for Users / Conversations / Messages
 // ======================================================================
 
 const { randomUUID } = require("crypto");
@@ -14,27 +12,14 @@ const { randomUUID } = require("crypto");
 const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
 
-// ---------- Optional Prisma client (safe fallback if it fails) ----------
-let prisma = null;
-let dbAvailable = false;
-
+// Try to load persistence; if DB/env is missing, we just log a warning and continue.
+let persistence = null;
 try {
-  const { PrismaClient } = require("@prisma/client");
-
-  if (!global.prisma) {
-    global.prisma = new PrismaClient();
-  }
-  prisma = global.prisma;
-  dbAvailable = true;
-  console.log("[Exerbud] Prisma client initialized");
-} catch (e) {
-  // This should NOT crash the lambda; we just log and carry on.
-  console.warn(
-    "[Exerbud] Prisma not available, running without DB memory:",
-    e?.message || e
-  );
-  prisma = null;
-  dbAvailable = false;
+  // eslint-disable-next-line global-require
+  persistence = require("../lib/exerbudPersistence");
+} catch (err) {
+  console.warn("[Exerbud] Prisma persistence not available:", err?.message || err);
+  persistence = null;
 }
 
 module.exports = async function handler(req, res) {
@@ -148,6 +133,7 @@ module.exports = async function handler(req, res) {
       : [];
 
     const coachProfile = body.coachProfile || null;
+    // We still accept workflow, but don’t *need* it for the model logic
     const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
 
     let conversationId = body.conversationId || null;
@@ -156,6 +142,42 @@ module.exports = async function handler(req, res) {
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
+    }
+
+    // Ensure we always have some external ID, even if frontend forgot
+    if (!userExternalId) {
+      userExternalId = `anon:${randomUUID()}`;
+    }
+
+    // ------------------------------------------------------------------
+    // Optional: persist user + conversation in DB (Prisma)
+    // ------------------------------------------------------------------
+    let dbUser = null;
+    let dbConversation = null;
+
+    if (persistence && process.env.DATABASE_URL) {
+      try {
+        const result = await persistence.ensureUserAndConversation({
+          externalId: userExternalId,
+          email: userEmail,
+          conversationId,
+          coachProfile,
+          workflow,
+        });
+
+        dbUser = result.user;
+        dbConversation = result.conversation;
+
+        // From now on we use the DB conversation id so frontend and DB stay in sync
+        if (dbConversation && dbConversation.id) {
+          conversationId = dbConversation.id;
+        }
+      } catch (err) {
+        console.warn(
+          "[Exerbud] Persistence error (ensureUserAndConversation):",
+          err?.message || err
+        );
+      }
     }
 
     // ------------------------------------------------------------------
@@ -264,95 +286,28 @@ General behavior:
       "I'm sorry — I couldn't generate a response.";
 
     // ------------------------------------------------------------------
-    // OPTIONAL: Persist basic memory to Postgres via Prisma
+    // Save messages to DB (if available)
     // ------------------------------------------------------------------
-    let outgoingConversationId = conversationId;
-    let outgoingUserExternalId = userExternalId;
-
-    if (dbAvailable && prisma) {
+    if (persistence && process.env.DATABASE_URL && dbConversation && dbUser) {
       try {
-        // 1) User (externalId + email)
-        let effectiveExternalId = userExternalId;
-        if (!effectiveExternalId) {
-          effectiveExternalId = "guest:" + randomUUID();
-        }
-
-        const user = await prisma.user.upsert({
-          where: { externalId: effectiveExternalId },
-          update: {
-            email: userEmail || undefined,
-          },
-          create: {
-            externalId: effectiveExternalId,
-            email: userEmail || null,
-          },
-        });
-
-        outgoingUserExternalId = user.externalId;
-
-        // 2) Conversation (thread)
-        let conversationRecord;
-
-        if (conversationId) {
-          conversationRecord = await prisma.conversation.upsert({
-            where: { id: conversationId },
-            update: {
-              coachProfile: coachProfile || undefined,
-              workflow: workflow || undefined,
-              endedAt: null,
-            },
-            create: {
-              id: conversationId,
-              userId: user.id,
-              coachProfile,
-              workflow,
-            },
-          });
-        } else {
-          conversationRecord = await prisma.conversation.create({
-            data: {
-              userId: user.id,
-              coachProfile,
-              workflow,
-            },
-          });
-        }
-
-        outgoingConversationId = conversationRecord.id;
-
-        // 3) Messages (last user turn + assistant reply)
-        if (message) {
-          await prisma.message.create({
-            data: {
-              conversationId: conversationRecord.id,
-              userId: user.id,
-              role: "user",
-              content: message,
-            },
-          });
-        }
-
-        await prisma.message.create({
-          data: {
-            conversationId: conversationRecord.id,
-            role: "assistant",
-            content: reply,
-          },
+        await persistence.saveMessagePair({
+          conversationId: dbConversation.id,
+          userId: dbUser.id,
+          userMessage: message,
+          assistantMessage: reply,
         });
       } catch (err) {
-        // If anything goes wrong with DB, log it but DO NOT fail the request.
-        console.error("[Exerbud] Prisma persistence error:", err);
+        console.warn(
+          "[Exerbud] Persistence error (saveMessagePair):",
+          err?.message || err
+        );
       }
     }
 
-    // ------------------------------------------------------------------
-    // Response
-    // ------------------------------------------------------------------
     return res.status(200).json({
       reply,
-      conversationId: outgoingConversationId || randomUUID(),
-      userExternalId:
-        outgoingUserExternalId || "guest:" + randomUUID(),
+      conversationId: conversationId || randomUUID(),
+      userExternalId,
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);
