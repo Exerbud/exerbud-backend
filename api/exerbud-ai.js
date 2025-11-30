@@ -19,6 +19,9 @@ try {
     // eslint-disable-next-line global-require
     const { PrismaClient } = require("@prisma/client");
     prisma = new PrismaClient();
+    console.log("[Exerbud] Prisma client initialized");
+  } else {
+    console.log("[Exerbud] No DATABASE_URL set; running without Prisma");
   }
 } catch (err) {
   console.warn(
@@ -27,6 +30,7 @@ try {
   );
   prisma = null;
 }
+
 
 module.exports = async function handler(req, res) {
   // --- CORS (for Shopify widget) ---
