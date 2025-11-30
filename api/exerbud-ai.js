@@ -1,10 +1,9 @@
 // ======================================================================
-// EXERBUD AI — BACKEND WITH OPTIONAL PRISMA MEMORY
+// EXERBUD AI — BACKEND WITH PRISMA MEMORY (USERS / CONVERSATIONS / MESSAGES)
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - Optional Prisma/Postgres logging (Users, Conversations, Messages)
-//   -> If Prisma or DB fails, we log a warning and continue without DB.
+// - Uses Prisma/Postgres when available (fails gracefully if not)
 // ======================================================================
 
 const { randomUUID } = require("crypto");
@@ -13,39 +12,42 @@ const { randomUUID } = require("crypto");
 const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
 
-// ------------------------------------------------------------------
-// Optional Prisma wiring (SAFE)
-// ------------------------------------------------------------------
+// ------------- Optional Prisma client (soft-fail if not configured) -------------
 let prisma = null;
-let prismaInitTried = false;
+let dbAvailable = false;
 
-function getPrismaSafe() {
-  if (prismaInitTried) return prisma;
-  prismaInitTried = true;
-  try {
-    // Require inside try so a bad install/env doesn't crash
+function getPrisma() {
+  if (!prisma) {
     const { PrismaClient } = require("@prisma/client");
     prisma = new PrismaClient();
-    console.log("[Exerbud] Prisma client initialized");
-  } catch (err) {
-    console.warn(
-      "[Exerbud] Prisma unavailable, running WITHOUT DB memory:",
-      err?.message || err
-    );
-    prisma = null;
   }
   return prisma;
 }
 
-// Get or create user
-async function getOrCreateUserSafe({ externalId, email }) {
-  const db = getPrismaSafe();
+// Helper: get DB or null, but never crash handler if Prisma fails
+function ensureDb() {
+  if (dbAvailable) return prisma;
+  try {
+    const db = getPrisma();
+    dbAvailable = true;
+    return db;
+  } catch (e) {
+    console.warn("[Exerbud] Prisma not available, running in stateless mode:", e?.message);
+    return null;
+  }
+}
+
+// ------------------------ DB helper functions ------------------------
+
+// Resolve or create a User based on externalId / email.
+async function getOrCreateUser({ externalId, email }) {
+  const db = ensureDb();
   if (!db || !externalId) return null;
 
-  try {
-    const dataToUpdate = { lastSeenAt: new Date() };
-    if (email) dataToUpdate.email = email;
+  const dataToUpdate = { lastSeenAt: new Date() };
+  if (email) dataToUpdate.email = email;
 
+  try {
     const user = await db.user.upsert({
       where: { externalId },
       create: {
@@ -54,32 +56,31 @@ async function getOrCreateUserSafe({ externalId, email }) {
       },
       update: dataToUpdate,
     });
-
     return user;
-  } catch (err) {
-    console.warn("[Exerbud] getOrCreateUserSafe failed:", err?.message || err);
+  } catch (e) {
+    console.warn("[Exerbud] getOrCreateUser failed:", e?.message);
     return null;
   }
 }
 
-// Get or create conversation
-async function getOrCreateConversationSafe({
-  user,
-  conversationId,
-  coachProfile,
-  workflow,
-}) {
-  const db = getPrismaSafe();
+// Resolve or create a Conversation for this user.
+async function getOrCreateConversation({ user, conversationId, coachProfile, workflow }) {
+  const db = ensureDb();
   if (!db || !user) return null;
 
-  try {
-    if (conversationId) {
+  // Try to reuse an existing conversation if the client sent an ID
+  if (conversationId) {
+    try {
       const existing = await db.conversation.findUnique({
         where: { id: conversationId },
       });
       if (existing) return existing;
+    } catch (e) {
+      console.warn("[Exerbud] Failed to reuse conversation:", e?.message);
     }
+  }
 
+  try {
     const convo = await db.conversation.create({
       data: {
         userId: user.id,
@@ -88,24 +89,20 @@ async function getOrCreateConversationSafe({
         source: "shopify_widget",
       },
     });
-
     return convo;
-  } catch (err) {
-    console.warn(
-      "[Exerbud] getOrCreateConversationSafe failed:",
-      err?.message || err
-    );
+  } catch (e) {
+    console.warn("[Exerbud] Failed to create conversation:", e?.message);
     return null;
   }
 }
 
-// Save a message row
-async function saveMessageSafe({ conversation, user, role, content }) {
-  const db = getPrismaSafe();
+// Store a single message row in the DB.
+async function saveMessage({ conversation, user, role, content }) {
+  const db = ensureDb();
   if (!db || !conversation || !role || !content) return null;
 
   try {
-    const msg = await db.message.create({
+    return await db.message.create({
       data: {
         conversationId: conversation.id,
         userId: user ? user.id : null,
@@ -113,9 +110,8 @@ async function saveMessageSafe({ conversation, user, role, content }) {
         content,
       },
     });
-    return msg;
-  } catch (err) {
-    console.warn("[Exerbud] saveMessageSafe failed:", err?.message || err);
+  } catch (e) {
+    console.warn("[Exerbud] Failed to save message:", e?.message);
     return null;
   }
 }
@@ -123,6 +119,7 @@ async function saveMessageSafe({ conversation, user, role, content }) {
 // ======================================================================
 // Main handler
 // ======================================================================
+
 module.exports = async function handler(req, res) {
   // --- CORS (for Shopify widget) ---
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -135,7 +132,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Simple GET healthcheck so hitting the URL in a browser works
+    // Simple GET healthcheck
     if (req.method === "GET") {
       return res.status(200).json({
         ok: true,
@@ -234,16 +231,12 @@ module.exports = async function handler(req, res) {
       : [];
 
     const coachProfile = body.coachProfile || null;
-    const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
+    const workflow = body.workflow || null; // currently unused, but stored on conversation
 
-    // Identity hints
-    const incomingConversationId = body.conversationId || null;
-    const incomingExternalId = body.userExternalId || body.externalId || null;
-    const email = body.userEmail || body.email || null;
-
-    // Always have *some* external ID, even if guest
-    const externalId =
-      incomingExternalId || `guest:${randomUUID().slice(0, 12)}`;
+    // Identity hints from frontend
+    const conversationIdFromClient = body.conversationId || null;
+    const userExternalIdFromClient = body.userExternalId || null;
+    const userEmailFromClient = body.userEmail || body.email || null;
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
@@ -336,26 +329,34 @@ General behavior:
     messages.push({ role: "user", content: userContent });
 
     // ------------------------------------------------------------------
-    // OPTIONAL DB: user + conversation + store user message
+    // DB: ensure User + Conversation + store user message
     // ------------------------------------------------------------------
-    const user = await getOrCreateUserSafe({ externalId, email });
-    const conversation = await getOrCreateConversationSafe({
+    const externalId =
+      userExternalIdFromClient || `guest:${randomUUID().slice(0, 12)}`;
+
+    const user = await getOrCreateUser({
+      externalId,
+      email: userEmailFromClient,
+    });
+
+    const conversation = await getOrCreateConversation({
       user,
-      conversationId: incomingConversationId,
+      conversationId: conversationIdFromClient,
       coachProfile,
       workflow,
     });
 
-    const rawUserContentForDB =
-      message || (attachments.length ? "[attachments]" : "");
-
-    if (conversation && rawUserContentForDB) {
-      await saveMessageSafe({
-        conversation,
-        user,
-        role: "user",
-        content: rawUserContentForDB,
-      });
+    if (conversation && (message || attachments.length)) {
+      const rawUserContentForDB =
+        message || (attachments.length ? "[attachments]" : "");
+      if (rawUserContentForDB) {
+        await saveMessage({
+          conversation,
+          user,
+          role: "user",
+          content: rawUserContentForDB,
+        });
+      }
     }
 
     // ------------------------------------------------------------------
@@ -377,9 +378,9 @@ General behavior:
       completion.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
 
-    // Save assistant message (if DB available)
+    // Save assistant message (if DB is available)
     if (conversation && reply) {
-      await saveMessageSafe({
+      await saveMessage({
         conversation,
         user: null,
         role: "assistant",
@@ -389,9 +390,7 @@ General behavior:
 
     return res.status(200).json({
       reply,
-      conversationId: conversation
-        ? conversation.id
-        : incomingConversationId || randomUUID(),
+      conversationId: conversation ? conversation.id : (conversationIdFromClient || randomUUID()),
       userExternalId: externalId,
     });
   } catch (error) {
