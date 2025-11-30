@@ -12,25 +12,22 @@ const { randomUUID } = require("crypto");
 const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
 
-// OPTIONAL Prisma client (for persistence)
+// ----------------------------------------------------------------------
+// Prisma client (optional)
+// ----------------------------------------------------------------------
 let prisma = null;
 try {
-  if (process.env.DATABASE_URL) {
-    // eslint-disable-next-line global-require
-    const { PrismaClient } = require("@prisma/client");
-    prisma = new PrismaClient();
-    console.log("[Exerbud] Prisma client initialized");
-  } else {
-    console.log("[Exerbud] No DATABASE_URL set; running without Prisma");
-  }
+  // This will throw if @prisma/client is not installed correctly
+  const { PrismaClient } = require("@prisma/client");
+  prisma = new PrismaClient();
+  console.log("[Exerbud] Prisma client loaded in /api/exerbud-ai");
 } catch (err) {
-  console.warn(
-    "[Exerbud] Prisma not available, running without DB:",
-    err?.message || err
+  console.error(
+    "[Exerbud] Failed to load PrismaClient in /api/exerbud-ai:",
+    err && err.message ? err.message : err
   );
   prisma = null;
 }
-
 
 module.exports = async function handler(req, res) {
   // --- CORS (for Shopify widget) ---
@@ -143,7 +140,6 @@ module.exports = async function handler(req, res) {
       : [];
 
     const coachProfile = body.coachProfile || null;
-    // We still accept workflow, but don’t *need* it for the model logic
     const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
 
     let conversationId = body.conversationId || null;
@@ -267,10 +263,18 @@ General behavior:
     // ------------------------------------------------------------------
     // OPTIONAL: Persist to Postgres via Prisma
     // ------------------------------------------------------------------
-    let finalConversationId = conversationId || randomUUID();
-    let finalUserExternalId = userExternalId || `guest:${randomUUID()}`;
+    const finalConversationId = conversationId || randomUUID();
+    const finalUserExternalId = userExternalId || `guest:${randomUUID()}`;
 
-    if (prisma && process.env.DATABASE_URL) {
+    if (!prisma) {
+      console.log(
+        "[Exerbud] Skipping DB save: prisma is null in /api/exerbud-ai"
+      );
+    } else if (!process.env.DATABASE_URL) {
+      console.log(
+        "[Exerbud] Skipping DB save: DATABASE_URL is missing in environment"
+      );
+    } else {
       try {
         // 1) Upsert user
         const user = await prisma.user.upsert({
@@ -302,7 +306,6 @@ General behavior:
         });
 
         // 3) Insert messages (user + assistant)
-        // User turn (if there was any input or attachments)
         if (message || attachments.length) {
           const userContentForDb =
             message ||
@@ -318,7 +321,6 @@ General behavior:
           });
         }
 
-        // Assistant turn
         await prisma.message.create({
           data: {
             conversationId: finalConversationId,
@@ -327,10 +329,15 @@ General behavior:
             content: reply,
           },
         });
+
+        console.log(
+          "[Exerbud] Saved messages to DB for conversation",
+          finalConversationId
+        );
       } catch (err) {
-        console.warn(
+        console.error(
           "[Exerbud] Failed to persist chat to DB:",
-          err?.message || err
+          err && err.message ? err.message : err
         );
       }
     }
