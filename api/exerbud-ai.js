@@ -24,7 +24,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Simple GET healthcheck so hitting the URL in a browser works
+    // Simple GET healthcheck
     if (req.method === "GET") {
       return res.status(200).json({
         ok: true,
@@ -38,7 +38,7 @@ module.exports = async function handler(req, res) {
     }
 
     // ------------------------------------------------------------------
-    // Body parsing (Vercel may give a string)
+    // Body parsing
     // ------------------------------------------------------------------
     let body = req.body;
     if (typeof body === "string") {
@@ -69,7 +69,7 @@ module.exports = async function handler(req, res) {
 
       doc.pipe(res);
 
-      // ---- Centered logo header (best-effort) ----
+      // ---- Centered logo header ----
       try {
         const logoRes = await fetch(EXERBUD_LOGO_URL);
         if (logoRes.ok) {
@@ -98,7 +98,7 @@ module.exports = async function handler(req, res) {
         doc.moveDown(1);
       }
 
-      // ---- Simple text body ----
+      // ---- Simple text ----
       doc.fontSize(12);
       const paragraphs = String(planText).split(/\n{2,}/);
 
@@ -123,8 +123,7 @@ module.exports = async function handler(req, res) {
       : [];
 
     const coachProfile = body.coachProfile || null;
-    // We still accept workflow, but don’t *need* it for the model logic
-    const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
+    const workflow = body.workflow || null;
 
     const conversationId = body.conversationId || null;
     const userExternalId = body.userExternalId || null;
@@ -134,7 +133,7 @@ module.exports = async function handler(req, res) {
     }
 
     // ------------------------------------------------------------------
-    // Format history for OpenAI (strip timestamps etc.)
+    // Format history
     // ------------------------------------------------------------------
     const formattedHistory = history.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
@@ -142,7 +141,7 @@ module.exports = async function handler(req, res) {
     }));
 
     // ------------------------------------------------------------------
-    // System prompt (light coach style hints)
+    // System prompt
     // ------------------------------------------------------------------
     let systemPrompt = `
 You are Exerbud AI, an expert fitness, strength, hypertrophy, mobility, and nutrition coach embedded on the Exerbud website.
@@ -152,7 +151,7 @@ General behavior:
 - Prefer short paragraphs and bullet points.
 - Keep tone friendly and encouraging.
 - Avoid markdown headings like "#", just use plain text and bullets.
-    `.trim();
+`.trim();
 
     if (coachProfile === "strength") {
       systemPrompt += " You focus more on strength training and compound lifts.";
@@ -170,11 +169,12 @@ General behavior:
     ];
 
     // ------------------------------------------------------------------
-    // Attachments → Vision-compatible content
+    // Attachments → Vision
     // ------------------------------------------------------------------
     const imageAttachments = attachments.filter(
       (f) => f?.type?.startsWith("image/") && typeof f.data === "string"
     );
+
     const otherAttachments = attachments.filter(
       (f) => !imageAttachments.includes(f)
     );
@@ -201,14 +201,19 @@ General behavior:
       const parts = [];
 
       if (augmentedUserMessage) {
-        parts.push({ type: "text", text: augmentedUserMessage });
+        parts.push({
+          type: "text",
+          text: augmentedUserMessage,
+        });
       }
 
       for (const img of imageAttachments) {
         const mime = img.type || "image/jpeg";
         parts.push({
           type: "image_url",
-          image_url: { url: `data:${mime};base64,${img.data}` },
+          image_url: {
+            url: `data:${mime};base64,${img.data}`,
+          },
         });
       }
 
@@ -217,13 +222,18 @@ General behavior:
       userContent = augmentedUserMessage || " ";
     }
 
-    messages.push({ role: "user", content: userContent });
+    messages.push({
+      role: "user",
+      content: userContent,
+    });
 
     // ------------------------------------------------------------------
     // OpenAI call
     // ------------------------------------------------------------------
     const OpenAI = (await import("openai")).default;
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const client = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
 
     const model = process.env.EXERBUD_MODEL || "gpt-4.1";
 
@@ -235,7 +245,7 @@ General behavior:
     });
 
     const reply =
-      completion.choices?.[0]?.message?.content?.trim() ||
+      completion?.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
 
     return res.status(200).json({
@@ -245,6 +255,7 @@ General behavior:
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);
+
     if (!res.headersSent) {
       return res.status(500).json({
         error: "Internal server error",
