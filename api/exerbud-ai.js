@@ -6,17 +6,19 @@
 // - Persists Users / Conversations / Messages / Uploads / ProgressEvents
 // ======================================================================
 
-const fetch = require("node-fetch");
-const { randomUUID } = require("crypto"); // use built-in UUID
+// We can use the built-in fetch on Vercel/Node 18+
+const { randomUUID } = require("crypto");
 
-// Prisma Client (reuse between invocations)
+// Prisma Client (lazy init so module load can't crash)
 const { PrismaClient } = require("@prisma/client");
 
-let prisma;
-if (!global._exerbudPrisma) {
-  global._exerbudPrisma = new PrismaClient();
+let prisma = null;
+function getPrisma() {
+  if (!prisma) {
+    prisma = new PrismaClient();
+  }
+  return prisma;
 }
-prisma = global._exerbudPrisma;
 
 // Logo URL for PDF header
 const EXERBUD_LOGO_URL =
@@ -32,17 +34,16 @@ const PROGRESS_JSON_TAG_END = "[[/PROGRESS_EVENT_JSON]]";
 
 /**
  * Resolve or create a User based on externalId / email.
- * externalId is something stable like:
- *   - "shopify:12345" for logged-in customers
- *   - "guest:<some-random-id>" for anonymous users
  */
 async function getOrCreateUser({ externalId, email }) {
   if (!externalId) return null;
 
+  const db = getPrisma();
+
   const dataToUpdate = { lastSeenAt: new Date() };
   if (email) dataToUpdate.email = email;
 
-  const user = await prisma.user.upsert({
+  const user = await db.user.upsert({
     where: { externalId },
     create: {
       externalId,
@@ -56,8 +57,6 @@ async function getOrCreateUser({ externalId, email }) {
 
 /**
  * Resolve or create a Conversation for this user.
- * If conversationId is provided, we try to use it,
- * otherwise we create a fresh conversation row.
  */
 async function getOrCreateConversation({
   user,
@@ -67,9 +66,11 @@ async function getOrCreateConversation({
 }) {
   if (!user) return null;
 
+  const db = getPrisma();
+
   if (conversationId) {
     try {
-      const existing = await prisma.conversation.findUnique({
+      const existing = await db.conversation.findUnique({
         where: { id: conversationId },
       });
       if (existing) return existing;
@@ -78,7 +79,7 @@ async function getOrCreateConversation({
     }
   }
 
-  const convo = await prisma.conversation.create({
+  const convo = await db.conversation.create({
     data: {
       userId: user.id,
       coachProfile: coachProfile || null,
@@ -92,12 +93,13 @@ async function getOrCreateConversation({
 
 /**
  * Store a single message row in the DB.
- * Returns the created Message row.
  */
 async function saveMessage({ conversation, user, role, content }) {
   if (!conversation || !role || !content) return null;
 
-  return prisma.message.create({
+  const db = getPrisma();
+
+  return db.message.create({
     data: {
       conversationId: conversation.id,
       userId: user ? user.id : null,
@@ -109,10 +111,11 @@ async function saveMessage({ conversation, user, role, content }) {
 
 /**
  * Store basic metadata for uploads (we do NOT store the base64 data).
- * We mark url = 'inline' to indicate it came from the chat payload.
  */
 async function saveUploads({ conversation, user, attachments, workflow }) {
   if (!conversation || !user || !attachments?.length) return;
+
+  const db = getPrisma();
 
   const rows = attachments.map((a) => ({
     userId: user.id,
@@ -122,7 +125,7 @@ async function saveUploads({ conversation, user, attachments, workflow }) {
     workflow: workflow || null,
   }));
 
-  await prisma.upload.createMany({ data: rows });
+  await db.upload.createMany({ data: rows });
 }
 
 /**
@@ -131,14 +134,16 @@ async function saveUploads({ conversation, user, attachments, workflow }) {
 async function saveProgressEvent({ user, conversation, message, type, payload }) {
   if (!user || !type || !payload) return;
 
+  const db = getPrisma();
+
   try {
-    await prisma.progressEvent.create({
+    await db.progressEvent.create({
       data: {
         userId: user.id,
         conversationId: conversation ? conversation.id : null,
         messageId: message ? message.id : null,
-        type, // "meal_log" | "body_scan" | "workout_plan" | "insight"
-        payload, // JS object -> Prisma Json
+        type, // "meal_log" | "body_scan" | "workout_plan"
+        payload,
       },
     });
   } catch (e) {
@@ -147,8 +152,7 @@ async function saveProgressEvent({ user, conversation, message, type, payload })
 }
 
 /**
- * Extract ProgressEvent JSON from the assistant reply and
- * return { cleanedText, event | null }.
+ * Extract ProgressEvent JSON from the assistant reply.
  */
 function extractProgressEventFromReply(text) {
   if (!text || typeof text !== "string") {
@@ -186,33 +190,34 @@ function extractProgressEventFromReply(text) {
 // Main handler (WITH CORS)
 // ----------------------------------------------
 module.exports = async function handler(req, res) {
-  //
   // --- GLOBAL CORS HEADERS (REQUIRED FOR SHOPIFY) ---
-  //
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Preflight
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-
-  // Simple health-check / browser GET
-  if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      message: "Exerbud AI backend is alive",
-    });
-  }
-
-  // Only POST allowed for real work
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST, OPTIONS");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-
   try {
+    // Preflight
+    if (req.method === "OPTIONS") {
+      return res.status(200).end();
+    }
+
+    // Simple GET healthcheck so hitting the URL in a browser doesn't explode
+    if (req.method === "GET") {
+      return res.status(200).json({
+        ok: true,
+        message: "Exerbud AI backend is alive",
+      });
+    }
+
+    // Only POST allowed for real work
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "GET, POST, OPTIONS");
+      return res.status(405).json({ error: "Method not allowed" });
+    }
+
+    // Make sure Prisma can initialize inside the try/catch
+    getPrisma();
+
     const body = req.body || {};
 
     // ==========================================================
@@ -238,14 +243,12 @@ module.exports = async function handler(req, res) {
       try {
         const logoRes = await fetch(EXERBUD_LOGO_URL);
         if (logoRes.ok) {
-          const logoBuffer = await logoRes.buffer();
+          const logoBuffer = await logoRes.arrayBuffer();
+          const logoBufNode = Buffer.from(logoBuffer);
 
-          // Measure the page
           const pageWidth = doc.page.width;
-
-          // Desired rendered width
           const renderWidth = 90;
-          const image = doc.openImage(logoBuffer);
+          const image = doc.openImage(logoBufNode);
 
           const scale = renderWidth / image.width;
           const renderHeight = image.height * scale;
@@ -253,7 +256,7 @@ module.exports = async function handler(req, res) {
           const x = (pageWidth - renderWidth) / 2;
           const y = 30;
 
-          doc.image(logoBuffer, x, y, {
+          doc.image(logoBufNode, x, y, {
             width: renderWidth,
             height: renderHeight,
           });
@@ -295,13 +298,10 @@ module.exports = async function handler(req, res) {
 
     // --- Identity hints coming from the frontend ---
     const rawExternalId =
-      body.userExternalId ||
-      body.externalId ||
-      null; // e.g. "shopify:12345" or "guest:xxxxx"
+      body.userExternalId || body.externalId || null;
     const email = body.userEmail || body.email || null;
     const conversationId = body.conversationId || null;
 
-    // If frontend hasn't sent a stable externalId yet, fall back to a per-request guest.
     const externalId =
       rawExternalId ||
       `guest:${body.clientId || body.sessionId || randomUUID().slice(0, 12)}`;
@@ -549,7 +549,6 @@ Do not explain the JSON and do not mention that you are creating a log; just inc
       workflow,
     });
 
-    // Save uploads metadata (does not store base64 itself)
     if (conversation && user && attachments.length) {
       try {
         await saveUploads({ conversation, user, attachments, workflow });
@@ -558,9 +557,10 @@ Do not explain the JSON and do not mention that you are creating a log; just inc
       }
     }
 
-    // Save the user message text (without search context, so analytics stay clean)
     const rawUserContentForDB =
       message || (attachments.length ? "[attachments]" : "");
+    let assistantMessageRow = null;
+
     if (conversation && rawUserContentForDB) {
       try {
         await saveMessage({
@@ -593,13 +593,11 @@ Do not explain the JSON and do not mention that you are creating a log; just inc
       completion.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
 
-    // Extract ProgressEvent JSON (if present)
     const extracted = extractProgressEventFromReply(reply);
     const cleanedReply = extracted.cleanedText;
     const progressPayload = extracted.event;
 
     // Save assistant message (without the JSON block)
-    let assistantMessageRow = null;
     if (conversation && cleanedReply) {
       try {
         assistantMessageRow = await saveMessage({
@@ -637,10 +635,12 @@ Do not explain the JSON and do not mention that you are creating a log; just inc
       userExternalId: externalId,
     });
   } catch (error) {
-    console.error("Exerbud AI backend error:", error);
-    return res.status(500).json({
-      error: "Internal server error",
-      details: error?.message || "Unknown error",
-    });
+    console.error("Exerbud AI backend error (top-level):", error);
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: "Internal server error",
+        details: error?.message || "Unknown error",
+      });
+    }
   }
 };
