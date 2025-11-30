@@ -1,9 +1,10 @@
 // ======================================================================
-// EXERBUD AI — MINIMAL NON-STREAMING BACKEND
+// EXERBUD AI — BACKEND WITH OPTIONAL PRISMA MEMORY
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - NO Prisma / DB / Google search
+// - Optional Prisma/Postgres logging (Users, Conversations, Messages)
+//   -> If Prisma or DB fails, we log a warning and continue without DB.
 // ======================================================================
 
 const { randomUUID } = require("crypto");
@@ -12,6 +13,116 @@ const { randomUUID } = require("crypto");
 const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
 
+// ------------------------------------------------------------------
+// Optional Prisma wiring (SAFE)
+// ------------------------------------------------------------------
+let prisma = null;
+let prismaInitTried = false;
+
+function getPrismaSafe() {
+  if (prismaInitTried) return prisma;
+  prismaInitTried = true;
+  try {
+    // Require inside try so a bad install/env doesn't crash
+    const { PrismaClient } = require("@prisma/client");
+    prisma = new PrismaClient();
+    console.log("[Exerbud] Prisma client initialized");
+  } catch (err) {
+    console.warn(
+      "[Exerbud] Prisma unavailable, running WITHOUT DB memory:",
+      err?.message || err
+    );
+    prisma = null;
+  }
+  return prisma;
+}
+
+// Get or create user
+async function getOrCreateUserSafe({ externalId, email }) {
+  const db = getPrismaSafe();
+  if (!db || !externalId) return null;
+
+  try {
+    const dataToUpdate = { lastSeenAt: new Date() };
+    if (email) dataToUpdate.email = email;
+
+    const user = await db.user.upsert({
+      where: { externalId },
+      create: {
+        externalId,
+        email: email || null,
+      },
+      update: dataToUpdate,
+    });
+
+    return user;
+  } catch (err) {
+    console.warn("[Exerbud] getOrCreateUserSafe failed:", err?.message || err);
+    return null;
+  }
+}
+
+// Get or create conversation
+async function getOrCreateConversationSafe({
+  user,
+  conversationId,
+  coachProfile,
+  workflow,
+}) {
+  const db = getPrismaSafe();
+  if (!db || !user) return null;
+
+  try {
+    if (conversationId) {
+      const existing = await db.conversation.findUnique({
+        where: { id: conversationId },
+      });
+      if (existing) return existing;
+    }
+
+    const convo = await db.conversation.create({
+      data: {
+        userId: user.id,
+        coachProfile: coachProfile || null,
+        workflow: workflow || null,
+        source: "shopify_widget",
+      },
+    });
+
+    return convo;
+  } catch (err) {
+    console.warn(
+      "[Exerbud] getOrCreateConversationSafe failed:",
+      err?.message || err
+    );
+    return null;
+  }
+}
+
+// Save a message row
+async function saveMessageSafe({ conversation, user, role, content }) {
+  const db = getPrismaSafe();
+  if (!db || !conversation || !role || !content) return null;
+
+  try {
+    const msg = await db.message.create({
+      data: {
+        conversationId: conversation.id,
+        userId: user ? user.id : null,
+        role,
+        content,
+      },
+    });
+    return msg;
+  } catch (err) {
+    console.warn("[Exerbud] saveMessageSafe failed:", err?.message || err);
+    return null;
+  }
+}
+
+// ======================================================================
+// Main handler
+// ======================================================================
 module.exports = async function handler(req, res) {
   // --- CORS (for Shopify widget) ---
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -123,11 +234,16 @@ module.exports = async function handler(req, res) {
       : [];
 
     const coachProfile = body.coachProfile || null;
-    // We still accept workflow, but don’t *need* it for the model logic
     const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
 
-    const conversationId = body.conversationId || null;
-    const userExternalId = body.userExternalId || null;
+    // Identity hints
+    const incomingConversationId = body.conversationId || null;
+    const incomingExternalId = body.userExternalId || body.externalId || null;
+    const email = body.userEmail || body.email || null;
+
+    // Always have *some* external ID, even if guest
+    const externalId =
+      incomingExternalId || `guest:${randomUUID().slice(0, 12)}`;
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
@@ -220,6 +336,29 @@ General behavior:
     messages.push({ role: "user", content: userContent });
 
     // ------------------------------------------------------------------
+    // OPTIONAL DB: user + conversation + store user message
+    // ------------------------------------------------------------------
+    const user = await getOrCreateUserSafe({ externalId, email });
+    const conversation = await getOrCreateConversationSafe({
+      user,
+      conversationId: incomingConversationId,
+      coachProfile,
+      workflow,
+    });
+
+    const rawUserContentForDB =
+      message || (attachments.length ? "[attachments]" : "");
+
+    if (conversation && rawUserContentForDB) {
+      await saveMessageSafe({
+        conversation,
+        user,
+        role: "user",
+        content: rawUserContentForDB,
+      });
+    }
+
+    // ------------------------------------------------------------------
     // OpenAI call
     // ------------------------------------------------------------------
     const OpenAI = (await import("openai")).default;
@@ -238,10 +377,22 @@ General behavior:
       completion.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
 
+    // Save assistant message (if DB available)
+    if (conversation && reply) {
+      await saveMessageSafe({
+        conversation,
+        user: null,
+        role: "assistant",
+        content: reply,
+      });
+    }
+
     return res.status(200).json({
       reply,
-      conversationId: conversationId || randomUUID(),
-      userExternalId: userExternalId || randomUUID(),
+      conversationId: conversation
+        ? conversation.id
+        : incomingConversationId || randomUUID(),
+      userExternalId: externalId,
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);
