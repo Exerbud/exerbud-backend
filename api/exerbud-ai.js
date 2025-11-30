@@ -7,7 +7,7 @@
 // ======================================================================
 
 const fetch = require("node-fetch");
-const { v4: uuidv4 } = require("uuid");
+const { randomUUID } = require("crypto"); // use built-in UUID
 
 // Prisma Client (reuse between invocations)
 const { PrismaClient } = require("@prisma/client");
@@ -127,16 +127,6 @@ async function saveUploads({ conversation, user, attachments, workflow }) {
 
 /**
  * Store a ProgressEvent row for dashboard analytics.
- * Matches your schema:
- * model ProgressEvent {
- *   id             String   @id @default(cuid())
- *   userId         String
- *   conversationId String?
- *   messageId      String?
- *   type           ProgressType
- *   payload        Json
- *   createdAt      DateTime @default(now())
- * }
  */
 async function saveProgressEvent({ user, conversation, message, type, payload }) {
   if (!user || !type || !payload) return;
@@ -159,14 +149,6 @@ async function saveProgressEvent({ user, conversation, message, type, payload })
 /**
  * Extract ProgressEvent JSON from the assistant reply and
  * return { cleanedText, event | null }.
- *
- * Expected shape in the model reply:
- *
- *   ...normal coaching text...
- *
- *   [[PROGRESS_EVENT_JSON]]
- *   { "type": "meal_log", "calories": 540, ... }
- *   [[/PROGRESS_EVENT_JSON]]
  */
 function extractProgressEventFromReply(text) {
   if (!text || typeof text !== "string") {
@@ -254,21 +236,20 @@ module.exports = async function handler(req, res) {
           const pageWidth = doc.page.width;
 
           // Desired rendered width
-          const renderWidth = 90; // adjust if needed (80–120 recommended)
+          const renderWidth = 90;
           const image = doc.openImage(logoBuffer);
 
           const scale = renderWidth / image.width;
           const renderHeight = image.height * scale;
 
-          const x = (pageWidth - renderWidth) / 2; // <-- CENTERED
-          const y = 30; // top margin
+          const x = (pageWidth - renderWidth) / 2;
+          const y = 30;
 
           doc.image(logoBuffer, x, y, {
             width: renderWidth,
             height: renderHeight,
           });
 
-          // Add space below logo
           doc.moveDown(4);
         }
       } catch (err) {
@@ -315,7 +296,7 @@ module.exports = async function handler(req, res) {
     // If frontend hasn't sent a stable externalId yet, fall back to a per-request guest.
     const externalId =
       rawExternalId ||
-      `guest:${body.clientId || body.sessionId || uuidv4().slice(0, 12)}`;
+      `guest:${body.clientId || body.sessionId || randomUUID().slice(0, 12)}`;
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
