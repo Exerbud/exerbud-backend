@@ -8,9 +8,13 @@
     "vercel-build": "echo \"No build step required\""
   },
   "dependencies": {
+    "@prisma/client": "^7.0.1",
     "@vercel/blob": "^2.0.0",
     "axios": "^1.6.0",
     "openai": "^4.104.0",
     "pdfkit": "^0.17.2"
+  },
+  "devDependencies": {
+    "prisma": "^7.0.1"
   }
 }

@@ -1,16 +1,204 @@
 // ======================================================================
-// EXERBUD AI — NON-STREAMING BACKEND
+// EXERBUD AI — NON-STREAMING BACKEND (WITH PRISMA DB + PROGRESS EVENTS)
 // - Google Search (optional)
 // - PDF Export (with centered logo, no visible title text)
 // - Vision support via attachments (image_url)
-// - User Identity (Shopify → Backend)
+// - Persists Users / Conversations / Messages / Uploads / ProgressEvents
 // ======================================================================
 
 const fetch = require("node-fetch");
+const { v4: uuidv4 } = require("uuid");
+
+// Prisma Client (reuse between invocations)
+const { PrismaClient } = require("@prisma/client");
+
+let prisma;
+if (!global._exerbudPrisma) {
+  global._exerbudPrisma = new PrismaClient();
+}
+prisma = global._exerbudPrisma;
 
 // Logo URL for PDF header
 const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
+
+// Tags used to hide machine-only JSON in the model reply
+const PROGRESS_JSON_TAG_START = "[[PROGRESS_EVENT_JSON]]";
+const PROGRESS_JSON_TAG_END = "[[/PROGRESS_EVENT_JSON]]";
+
+// ----------------------------------------------
+// Helpers for identity + DB
+// ----------------------------------------------
+
+/**
+ * Resolve or create a User based on externalId / email.
+ * externalId is something stable like:
+ *   - "shopify:12345" for logged-in customers
+ *   - "guest:<some-random-id>" for anonymous users
+ */
+async function getOrCreateUser({ externalId, email }) {
+  if (!externalId) return null;
+
+  const dataToUpdate = { lastSeenAt: new Date() };
+  if (email) dataToUpdate.email = email;
+
+  const user = await prisma.user.upsert({
+    where: { externalId },
+    create: {
+      externalId,
+      email: email || null,
+    },
+    update: dataToUpdate,
+  });
+
+  return user;
+}
+
+/**
+ * Resolve or create a Conversation for this user.
+ * If conversationId is provided, we try to use it,
+ * otherwise we create a fresh conversation row.
+ */
+async function getOrCreateConversation({
+  user,
+  conversationId,
+  coachProfile,
+  workflow,
+}) {
+  if (!user) return null;
+
+  if (conversationId) {
+    try {
+      const existing = await prisma.conversation.findUnique({
+        where: { id: conversationId },
+      });
+      if (existing) return existing;
+    } catch (err) {
+      console.warn("[Exerbud] Failed to reuse conversation:", err?.message);
+    }
+  }
+
+  const convo = await prisma.conversation.create({
+    data: {
+      userId: user.id,
+      coachProfile: coachProfile || null,
+      workflow: workflow || null,
+      source: "shopify_widget",
+    },
+  });
+
+  return convo;
+}
+
+/**
+ * Store a single message row in the DB.
+ * Returns the created Message row.
+ */
+async function saveMessage({ conversation, user, role, content }) {
+  if (!conversation || !role || !content) return null;
+
+  return prisma.message.create({
+    data: {
+      conversationId: conversation.id,
+      userId: user ? user.id : null,
+      role,
+      content,
+    },
+  });
+}
+
+/**
+ * Store basic metadata for uploads (we do NOT store the base64 data).
+ * We mark url = 'inline' to indicate it came from the chat payload.
+ */
+async function saveUploads({ conversation, user, attachments, workflow }) {
+  if (!conversation || !user || !attachments?.length) return;
+
+  const rows = attachments.map((a) => ({
+    userId: user.id,
+    conversationId: conversation.id,
+    url: "inline",
+    type: a.type || "unknown",
+    workflow: workflow || null,
+  }));
+
+  await prisma.upload.createMany({ data: rows });
+}
+
+/**
+ * Store a ProgressEvent row for dashboard analytics.
+ * Matches your schema:
+ * model ProgressEvent {
+ *   id             String   @id @default(cuid())
+ *   userId         String
+ *   conversationId String?
+ *   messageId      String?
+ *   type           ProgressType
+ *   payload        Json
+ *   createdAt      DateTime @default(now())
+ * }
+ */
+async function saveProgressEvent({ user, conversation, message, type, payload }) {
+  if (!user || !type || !payload) return;
+
+  try {
+    await prisma.progressEvent.create({
+      data: {
+        userId: user.id,
+        conversationId: conversation ? conversation.id : null,
+        messageId: message ? message.id : null,
+        type, // "meal_log" | "body_scan" | "workout_plan" | "insight"
+        payload, // JS object -> Prisma Json
+      },
+    });
+  } catch (e) {
+    console.warn("[Exerbud] Failed to save ProgressEvent:", e?.message);
+  }
+}
+
+/**
+ * Extract ProgressEvent JSON from the assistant reply and
+ * return { cleanedText, event | null }.
+ *
+ * Expected shape in the model reply:
+ *
+ *   ...normal coaching text...
+ *
+ *   [[PROGRESS_EVENT_JSON]]
+ *   { "type": "meal_log", "calories": 540, ... }
+ *   [[/PROGRESS_EVENT_JSON]]
+ */
+function extractProgressEventFromReply(text) {
+  if (!text || typeof text !== "string") {
+    return { cleanedText: text, event: null };
+  }
+
+  const start = text.indexOf(PROGRESS_JSON_TAG_START);
+  const end = text.indexOf(PROGRESS_JSON_TAG_END);
+
+  if (start === -1 || end === -1 || end <= start) {
+    return { cleanedText: text, event: null };
+  }
+
+  const jsonRaw = text
+    .substring(start + PROGRESS_JSON_TAG_START.length, end)
+    .trim();
+
+  let payload = null;
+  try {
+    if (jsonRaw) {
+      payload = JSON.parse(jsonRaw);
+    }
+  } catch (e) {
+    console.warn("[Exerbud] Failed to parse progress JSON:", e?.message);
+  }
+
+  const cleanedText = (
+    text.slice(0, start) + text.slice(end + PROGRESS_JSON_TAG_END.length)
+  ).trim();
+
+  return { cleanedText: cleanedText || text, event: payload };
+}
 
 // ----------------------------------------------
 // Main handler (WITH CORS)
@@ -56,20 +244,31 @@ module.exports = async function handler(req, res) {
 
       doc.pipe(res);
 
-      // --- Centered Logo ---
+      // -------- CENTERED LOGO HEADER ----------
       try {
         const logoRes = await fetch(EXERBUD_LOGO_URL);
         if (logoRes.ok) {
-          const buf = await logoRes.buffer();
-          const pageWidth = doc.page.width;
-          const desiredWidth = 90;
-          const img = doc.openImage(buf);
-          const scale = desiredWidth / img.width;
-          const renderedHeight = img.height * scale;
-          const x = (pageWidth - desiredWidth) / 2;
-          const y = 30;
+          const logoBuffer = await logoRes.buffer();
 
-          doc.image(buf, x, y, { width: desiredWidth, height: renderedHeight });
+          // Measure the page
+          const pageWidth = doc.page.width;
+
+          // Desired rendered width
+          const renderWidth = 90; // adjust if needed (80–120 recommended)
+          const image = doc.openImage(logoBuffer);
+
+          const scale = renderWidth / image.width;
+          const renderHeight = image.height * scale;
+
+          const x = (pageWidth - renderWidth) / 2; // <-- CENTERED
+          const y = 30; // top margin
+
+          doc.image(logoBuffer, x, y, {
+            width: renderWidth,
+            height: renderHeight,
+          });
+
+          // Add space below logo
           doc.moveDown(4);
         }
       } catch (err) {
@@ -77,15 +276,16 @@ module.exports = async function handler(req, res) {
         doc.moveDown(1);
       }
 
-      // --- Body text ---
+      // -------- PDF BODY TEXT ----------
       doc.fontSize(12);
+
       const paragraphs = String(planText).split(/\n{2,}/);
 
-      paragraphs.forEach((p, i) => {
-        const clean = p.trim();
+      paragraphs.forEach((para, index) => {
+        const clean = para.trim();
         if (!clean) return;
         doc.text(clean);
-        if (i < paragraphs.length - 1) doc.moveDown();
+        if (index < paragraphs.length - 1) doc.moveDown();
       });
 
       doc.end();
@@ -95,61 +295,143 @@ module.exports = async function handler(req, res) {
     // ==========================================================
     //  NORMAL CHAT REQUEST
     // ==========================================================
-    const message = (body.message || "").trim();
+    const message = (body.message || "").toString().trim();
     const history = Array.isArray(body.history) ? body.history : [];
-    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+    const attachments = Array.isArray(body.attachments)
+      ? body.attachments
+      : [];
     const enableSearch = Boolean(body.enableSearch);
     const coachProfile = body.coachProfile || null;
+    const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
 
-    // 👉 NEW: User identity forwarded from frontend
-    const userId = body.userId || null;
-    const userEmail = body.userEmail || null;
+    // --- Identity hints coming from the frontend ---
+    const rawExternalId =
+      body.userExternalId ||
+      body.externalId ||
+      null; // e.g. "shopify:12345" or "guest:xxxxx"
+    const email = body.userEmail || body.email || null;
+    const conversationId = body.conversationId || null;
 
-    console.log("[Exerbud] Request from:", { userId, userEmail });
+    // If frontend hasn't sent a stable externalId yet, fall back to a per-request guest.
+    const externalId =
+      rawExternalId ||
+      `guest:${body.clientId || body.sessionId || uuidv4().slice(0, 12)}`;
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
     }
 
     // ----------------------------------------------------------
-    // Prepare formatted history for OpenAI
+    // Prepare formatted history for the model
     // ----------------------------------------------------------
     const formattedHistory = history.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
-      content: String(m.content || "").slice(0, 4000),
+      content: (m.content || "").toString().slice(0, 4000),
     }));
 
     const messages = [...formattedHistory];
 
     // ----------------------------------------------------------
-    // SYSTEM PROMPT (improved)
+    // SYSTEM PROMPT (WITH WEB SEARCH BEHAVIOR + PROGRESS JSON)
     // ----------------------------------------------------------
     let systemPrompt = `
-You are Exerbud AI — an expert fitness, strength, hypertrophy, mobility, and nutrition coach.
+You are Exerbud AI — an expert fitness, strength, hypertrophy, mobility, and nutrition coach embedded on the Exerbud website.
 
-RULES:
-- You always respond in clear, practical, friendly language.
-- Use short paragraphs and bullet points.
-- No markdown headers (“# Title”).
-- You *can* incorporate information from web search results.
-- You *never* say “I cannot browse the internet.”
-- You *never* mention [WEB SEARCH RESULTS] or internal formatting.
-- You behave consistently across sessions, especially for known users.
+You:
+- Give clear, practical, sustainable advice.
+- Prefer short paragraphs and bullet points.
+- Avoid markdown headings like "#" in your responses.
+
+You may sometimes receive extra context that includes live web search results, clearly labeled in the user message (for example with tags like [WEB SEARCH RESULTS]).
+Treat this as information retrieved from the internet and use it to improve your answers.
+
+Very important:
+- Do NOT say things like "I cannot browse the internet" or "I don't have access to the web."
+- If the user asks whether you can search the internet, respond naturally that you can pull in up-to-date information from the web when it's helpful and combine it with your general fitness and nutrition knowledge.
+- Do not mention internal labels like [WEB SEARCH RESULTS], [Search Context], or "tools" in your replies — just answer as if you already knew the information.
+
+Formatting:
+- No markdown headers.
+- Use bullet points and short, scannable sections.
 `;
 
-    if (coachProfile === "strength") systemPrompt += " Coaching mode: Strength focus.";
-    else if (coachProfile === "hypertrophy") systemPrompt += " Coaching mode: Muscle growth focus.";
-    else if (coachProfile === "mobility") systemPrompt += " Coaching mode: Mobility & movement quality.";
-    else if (coachProfile === "fat_loss") systemPrompt += " Coaching mode: Sustainable fat loss.";
-
-    // 👉 NEW: User identity awareness
-    if (userId) {
-      systemPrompt += ` You are speaking to the same returning user: ${userId}. Maintain consistency and support long-term tracking.`;
-    } else {
-      systemPrompt += " This may be a guest user with no persistent identity.";
+    if (coachProfile === "strength") {
+      systemPrompt += " You focus more on strength and compound lifts.";
+    } else if (coachProfile === "hypertrophy") {
+      systemPrompt += " You focus more on hypertrophy and muscle growth.";
+    } else if (coachProfile === "mobility") {
+      systemPrompt += " You focus more on mobility and joint quality.";
+    } else if (coachProfile === "fat_loss") {
+      systemPrompt += " You focus more on sustainable fat loss.";
     }
 
-    messages.unshift({ role: "system", content: systemPrompt });
+    // --- workflow-specific JSON instructions ---
+    if (workflow === "food_scan") {
+      systemPrompt += `
+For food images, after giving your normal explanation, you MUST also output a single JSON object between the tags ${PROGRESS_JSON_TAG_START} and ${PROGRESS_JSON_TAG_END}.
+
+This JSON is for logging a meal_log progress event and must have:
+- "type": "meal_log"
+- "calories": number (estimated total kcal)
+- "protein_g": number
+- "carbs_g": number
+- "fat_g": number
+- "fiber_g": number | null
+- "sugar_g": number | null
+- "meal_label": "breakfast" | "lunch" | "dinner" | "snack" | "unknown"
+- "quality_score": number between 0 and 100 (higher is better)
+- "notes": short string summary (1–2 sentences)
+
+Example:
+${PROGRESS_JSON_TAG_START}
+{"type":"meal_log","calories":540,"protein_g":32,"carbs_g":55,"fat_g":20,"fiber_g":7,"sugar_g":10,"meal_label":"lunch","quality_score":78,"notes":"Balanced lunch with good protein, slightly high in carbs."}
+${PROGRESS_JSON_TAG_END}
+
+Do not explain the JSON and do not mention that you are creating a log; just include the block at the end.`;
+    } else if (workflow === "body_scan") {
+      systemPrompt += `
+For body progress photos, after giving your normal explanation, you MUST also output a single JSON object between the tags ${PROGRESS_JSON_TAG_START} and ${PROGRESS_JSON_TAG_END}.
+
+This JSON is for logging a body_scan progress event and must have:
+- "type": "body_scan"
+- "trend": "improving" | "stable" | "regressing" | "unclear"
+- "focus_areas": array of short strings like ["waist", "shoulders"]
+- "estimated_changes": string (1–2 sentences describing visual changes)
+- "confidence": number between 0 and 1 (how confident you are in the visual assessment)
+- "notes": string with extra context or advice
+
+Example:
+${PROGRESS_JSON_TAG_START}
+{"type":"body_scan","trend":"improving","focus_areas":["waist","shoulders"],"estimated_changes":"Waist appears slightly leaner and shoulders a bit fuller compared to prior photos.","confidence":0.75,"notes":"Body composition trending in the right direction; keep training volume and protein consistent."}
+${PROGRESS_JSON_TAG_END}
+
+Do not explain the JSON and do not mention that you are creating a log; just include the block at the end.`;
+    } else if (workflow === "fitness_plan") {
+      systemPrompt += `
+For weekly workout plans, after giving your normal explanation/plan, you MUST also output a single JSON object between the tags ${PROGRESS_JSON_TAG_START} and ${PROGRESS_JSON_TAG_END}.
+
+This JSON is for logging a workout_plan progress event and must have:
+- "type": "workout_plan"
+- "training_days_per_week": number
+- "goal": short string (e.g. "fat loss", "hypertrophy", "strength")
+- "experience_level": "beginner" | "intermediate" | "advanced"
+- "plan": array of days; each day has:
+    - "day": string (e.g. "Monday" or "Day 1")
+    - "focus": string (e.g. "Upper body push")
+    - "exercises": array of { "name": string, "sets": number, "reps": string }
+
+Example:
+${PROGRESS_JSON_TAG_START}
+{"type":"workout_plan","training_days_per_week":4,"goal":"hypertrophy","experience_level":"intermediate","plan":[{"day":"Day 1","focus":"Upper body push","exercises":[{"name":"Barbell bench press","sets":4,"reps":"6-8"},{"name":"Incline dumbbell press","sets":3,"reps":"8-10"}]}]}
+${PROGRESS_JSON_TAG_END}
+
+Do not explain the JSON and do not mention that you are creating a log; just include the block at the end.`;
+    }
+
+    messages.unshift({
+      role: "system",
+      content: systemPrompt,
+    });
 
     // ==========================================================
     // GOOGLE SEARCH (OPTIONAL)
@@ -170,22 +452,28 @@ RULES:
         url.searchParams.set("cx", process.env.GOOGLE_CX);
         url.searchParams.set("q", query);
 
-        console.log("[Exerbud] Searching:", query);
+        console.log("[Exerbud] Performing web search for query:", query);
 
         const searchRes = await fetch(url.toString());
-
         if (searchRes.ok) {
           const data = await searchRes.json();
-
           if (data.items?.length) {
-            toolResultsText = data.items
+            const snippets = data.items
               .slice(0, 5)
-              .map(
-                (item, i) =>
-                  `${i + 1}. ${item.title || ""}\n${item.snippet || ""}\n${item.link || ""}`
-              )
+              .map((item, i) => {
+                return `${i + 1}. ${item.title || ""}\n${
+                  item.snippet || ""
+                }\n${item.link || ""}`;
+              })
               .join("\n\n");
+
+            toolResultsText = snippets;
           }
+        } else {
+          console.warn(
+            "[Exerbud] Google search HTTP status:",
+            searchRes.status
+          );
         }
       } catch (err) {
         console.error("Search error:", err);
@@ -193,48 +481,58 @@ RULES:
     }
 
     // ==========================================================
-    // Attachments → image & other types
+    // Attachments: images vs other files
     // ==========================================================
     const imageAttachments = attachments.filter(
       (f) => f?.type?.startsWith("image/") && typeof f.data === "string"
     );
+
     const otherAttachments = attachments.filter(
       (f) => !imageAttachments.includes(f)
     );
 
     // ----------------------------------------------------------
-    // Build user message
+    // Build textual user message (INCLUDING WEB RESULTS)
     // ----------------------------------------------------------
     let augmentedUserMessage = message || "";
 
     if (toolResultsText) {
       augmentedUserMessage +=
-        "\n\n[WEB SEARCH RESULTS]\n\n" +
+        (augmentedUserMessage ? "\n\n" : "") +
+        "[WEB SEARCH RESULTS]\n\n" +
         toolResultsText +
-        "\n\n[END OF WEB SEARCH RESULTS]\n" +
-        "(Use this information silently but never mention search results.)";
+        "\n\n[END OF WEB SEARCH RESULTS]\n\n" +
+        "(Use this background information to give a better answer, but do not mention that you saw search results.)";
     }
 
     if (otherAttachments.length) {
+      const fileLines = otherAttachments.map((f) => {
+        const name = f.name || "file";
+        const type = f.type || "unknown";
+        const sizeKB = f.size ? Math.round(f.size / 1024) : "unknown";
+        return `- ${name} (${type}, ~${sizeKB} KB)`;
+      });
+
       augmentedUserMessage +=
-        "\n\n[Attached files]\n" +
-        otherAttachments
-          .map((f) => {
-            const sizeKB = f.size ? Math.round(f.size / 1024) : "unknown";
-            return `- ${f.name || "file"} (${f.type || "unknown"}, ~${sizeKB} KB)`;
-          })
-          .join("\n");
+        (augmentedUserMessage ? "\n\n" : "") +
+        "[Attached files]\n" +
+        fileLines.join("\n");
     }
 
     // ----------------------------------------------------------
-    // Build "content" for OpenAI (with image_url parts)
+    // Build userMessage content with images (for OpenAI Vision)
     // ----------------------------------------------------------
     let userContent;
 
     if (imageAttachments.length) {
       const parts = [];
 
-      if (augmentedUserMessage) parts.push({ type: "text", text: augmentedUserMessage });
+      if (augmentedUserMessage) {
+        parts.push({
+          type: "text",
+          text: augmentedUserMessage,
+        });
+      }
 
       for (const img of imageAttachments) {
         const mime = img.type || "image/jpeg";
@@ -252,7 +550,43 @@ RULES:
     messages.push({ role: "user", content: userContent });
 
     // ==========================================================
-    // OPENAI COMPLETION
+    //  DB: ensure User + Conversation + store user message
+    // ==========================================================
+    const user = await getOrCreateUser({ externalId, email });
+    const conversation = await getOrCreateConversation({
+      user,
+      conversationId,
+      coachProfile,
+      workflow,
+    });
+
+    // Save uploads metadata (does not store base64 itself)
+    if (conversation && user && attachments.length) {
+      try {
+        await saveUploads({ conversation, user, attachments, workflow });
+      } catch (e) {
+        console.warn("[Exerbud] Failed to save uploads:", e?.message);
+      }
+    }
+
+    // Save the user message text (without search context, so analytics stay clean)
+    const rawUserContentForDB =
+      message || (attachments.length ? "[attachments]" : "");
+    if (conversation && rawUserContentForDB) {
+      try {
+        await saveMessage({
+          conversation,
+          user,
+          role: "user",
+          content: rawUserContentForDB,
+        });
+      } catch (e) {
+        console.warn("[Exerbud] Failed to save user message:", e?.message);
+      }
+    }
+
+    // ==========================================================
+    // OPENAI RESPONSE
     // ==========================================================
     const OpenAI = (await import("openai")).default;
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -266,11 +600,53 @@ RULES:
       max_tokens: 900,
     });
 
-    const reply =
+    let reply =
       completion.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
 
-    return res.status(200).json({ reply });
+    // Extract ProgressEvent JSON (if present)
+    const extracted = extractProgressEventFromReply(reply);
+    const cleanedReply = extracted.cleanedText;
+    const progressPayload = extracted.event;
+
+    // Save assistant message (without the JSON block)
+    let assistantMessageRow = null;
+    if (conversation && cleanedReply) {
+      try {
+        assistantMessageRow = await saveMessage({
+          conversation,
+          user: null,
+          role: "assistant",
+          content: cleanedReply,
+        });
+      } catch (e) {
+        console.warn("[Exerbud] Failed to save assistant message:", e?.message);
+      }
+    }
+
+    // If we got a progress payload AND this is a known workflow -> create ProgressEvent
+    if (progressPayload && user && workflow) {
+      let progressType = null;
+      if (workflow === "food_scan") progressType = "meal_log";
+      else if (workflow === "body_scan") progressType = "body_scan";
+      else if (workflow === "fitness_plan") progressType = "workout_plan";
+
+      if (progressType) {
+        await saveProgressEvent({
+          user,
+          conversation,
+          message: assistantMessageRow,
+          type: progressType,
+          payload: progressPayload,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      reply: cleanedReply,
+      conversationId: conversation ? conversation.id : null,
+      userExternalId: externalId,
+    });
   } catch (error) {
     console.error("Exerbud AI backend error:", error);
     return res.status(500).json({

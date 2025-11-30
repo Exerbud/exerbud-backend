@@ -1,0 +1,139 @@
+// prisma/schema.prisma
+
+datasource db {
+  provider = "postgresql"
+  // NOTE: In Prisma 7 the URL lives in prisma.config.ts / env,
+  // so we do NOT put `url =` here anymore.
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/**
+ * USERS
+ * Tracks a unique Exerbud user (Shopify customer or guest)
+ */
+model User {
+  id            String           @id @default(cuid())
+  externalId    String           @unique // e.g. "shopify:12345" or "guest:uuid"
+  email         String?          @unique
+  createdAt     DateTime         @default(now())
+  lastSeenAt    DateTime         @updatedAt
+
+  conversations Conversation[]
+  uploads       Upload[]
+  events        ProgressEvent[]
+  profileMemory UserProfileMemory?
+}
+
+/**
+ * CONVERSATIONS
+ * One chat “thread” in the widget
+ */
+model Conversation {
+  id            String           @id @default(cuid())
+  user          User             @relation(fields: [userId], references: [id])
+  userId        String
+  startedAt     DateTime         @default(now())
+  endedAt       DateTime?
+  source        String           @default("shopify_widget")
+  coachProfile  CoachProfile?
+  workflow      Workflow?
+
+  messages      Message[]
+  uploads       Upload[]
+  events        ProgressEvent[]
+}
+
+/**
+ * MESSAGES
+ * Individual user/assistant turns in a conversation
+ */
+model Message {
+  id             String         @id @default(cuid())
+  conversation   Conversation   @relation(fields: [conversationId], references: [id])
+  conversationId String
+  userId         String?
+  role           MessageRole
+  content        String
+  createdAt      DateTime       @default(now())
+
+  events         ProgressEvent[]
+}
+
+/**
+ * UPLOADS
+ * Files and photos attached to messages
+ */
+model Upload {
+  id             String         @id @default(cuid())
+  user           User           @relation(fields: [userId], references: [id])
+  userId         String
+  conversation   Conversation?  @relation(fields: [conversationId], references: [id])
+  conversationId String?
+  url            String
+  type           String         // "image/jpeg", "application/pdf", etc.
+  workflow       Workflow?
+  createdAt      DateTime       @default(now())
+}
+
+/**
+ * PROGRESS EVENTS
+ * Structured objects extracted from chats (meal logs, body scans, plans, etc.)
+ */
+model ProgressEvent {
+  id             String         @id @default(cuid())
+  user           User           @relation(fields: [userId], references: [id])
+  userId         String
+  conversation   Conversation?  @relation(fields: [conversationId], references: [id])
+  conversationId String?
+  message        Message?       @relation(fields: [messageId], references: [id])
+  messageId      String?
+  type           ProgressType
+  payload        Json
+  createdAt      DateTime       @default(now())
+}
+
+/**
+ * LONG-TERM PROFILE MEMORY
+ */
+model UserProfileMemory {
+  id             String   @id @default(cuid())
+  user           User     @relation(fields: [userId], references: [id])
+  userId         String   @unique
+  goals          String?
+  trainingLevel  String?
+  injuries       String?
+  preferredCoach String?
+  data           Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+/* ------------------ ENUMS ------------------ */
+
+enum MessageRole {
+  user
+  assistant
+}
+
+enum Workflow {
+  food_scan
+  body_scan
+  fitness_plan
+}
+
+enum ProgressType {
+  meal_log
+  body_scan
+  workout_plan
+  insight
+}
+
+enum CoachProfile {
+  strength
+  hypertrophy
+  mobility
+  fat_loss
+}
