@@ -2,12 +2,13 @@
 
 datasource db {
   provider = "postgresql"
-  // No `url` here in Prisma 7 – it lives in prisma.config.ts
+  // ⬆️ NO url line here at all
 }
 
 generator client {
   provider = "prisma-client-js"
 }
+
 
 /**
  * USERS

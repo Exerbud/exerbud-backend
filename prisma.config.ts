@@ -1,4 +1,4 @@
-// prisma/prisma.config.ts
+// prisma.config.ts  (at project root)
 import "dotenv/config";
 import { defineConfig, env } from "prisma/config";
 
@@ -9,7 +9,7 @@ export default defineConfig({
     path: "prisma/migrations",
   },
 
-  // In Prisma 7 the datasource URL lives here (not in schema.prisma)
+  // Prisma 7: datasource URL lives here
   datasource: {
     url: env("DATABASE_URL"),
   },
