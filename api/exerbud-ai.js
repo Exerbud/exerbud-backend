@@ -1,101 +1,16 @@
 // ======================================================================
-// EXERBUD AI — NON-STREAMING BACKEND (WITH BASIC DB MEMORY)
+// EXERBUD AI — MINIMAL NON-STREAMING BACKEND
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - Prisma DB for User / Conversation / Message
+// - NO Prisma / DB / Google search
 // ======================================================================
 
 const { randomUUID } = require("crypto");
-const { PrismaClient } = require("@prisma/client");
 
-// ---------- Prisma (lazy init so cold starts don't explode) ----------
-let prisma = null;
-function getPrisma() {
-  if (!prisma) {
-    prisma = new PrismaClient();
-  }
-  return prisma;
-}
-
-// ---------- Logo URL for PDF header (optional) ----------
+// Logo URL for PDF header (optional)
 const EXERBUD_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0731/9882/9803/files/exerbudfulllogotransparentcircle.png?v=1734438468";
-
-// ======================================================================
-// DB HELPERS (match your previous schema: user / conversation / message)
-// ======================================================================
-
-async function getOrCreateUser({ externalId, email }) {
-  if (!externalId) return null;
-
-  const db = getPrisma();
-  const dataToUpdate = { lastSeenAt: new Date() };
-  if (email) dataToUpdate.email = email;
-
-  const user = await db.user.upsert({
-    where: { externalId },
-    create: {
-      externalId,
-      email: email || null,
-    },
-    update: dataToUpdate,
-  });
-
-  return user;
-}
-
-async function getOrCreateConversation({
-  user,
-  conversationId,
-  coachProfile,
-  workflow,
-}) {
-  if (!user) return null;
-  const db = getPrisma();
-
-  // Try to reuse an existing conversation if ID is provided
-  if (conversationId) {
-    try {
-      const existing = await db.conversation.findUnique({
-        where: { id: conversationId },
-      });
-      if (existing) return existing;
-    } catch (err) {
-      console.warn("[Exerbud] Failed to reuse conversation:", err?.message);
-    }
-  }
-
-  // Otherwise, create a new conversation
-  const convo = await db.conversation.create({
-    data: {
-      userId: user.id,
-      coachProfile: coachProfile || null,
-      workflow: workflow || null,
-      source: "shopify_widget",
-    },
-  });
-
-  return convo;
-}
-
-async function saveMessage({ conversation, user, role, content }) {
-  if (!conversation || !role || !content) return null;
-
-  const db = getPrisma();
-  return db.message.create({
-    data: {
-      conversationId: conversation.id,
-      userId: user ? user.id : null,
-      role,
-      content,
-    },
-  });
-}
-
-// ======================================================================
-// MAIN HANDLER
-// ======================================================================
 
 module.exports = async function handler(req, res) {
   // --- CORS (for Shopify widget) ---
@@ -109,7 +24,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Simple GET healthcheck so hitting the URL in a browser works
+    // Simple GET healthcheck
     if (req.method === "GET") {
       return res.status(200).json({
         ok: true,
@@ -123,7 +38,7 @@ module.exports = async function handler(req, res) {
     }
 
     // ------------------------------------------------------------------
-    // Body parsing (Vercel may give a string)
+    // Body parsing
     // ------------------------------------------------------------------
     let body = req.body;
     if (typeof body === "string") {
@@ -154,7 +69,7 @@ module.exports = async function handler(req, res) {
 
       doc.pipe(res);
 
-      // ---- Centered logo header (best-effort) ----
+      // ---- Centered logo header ----
       try {
         const logoRes = await fetch(EXERBUD_LOGO_URL);
         if (logoRes.ok) {
@@ -183,7 +98,7 @@ module.exports = async function handler(req, res) {
         doc.moveDown(1);
       }
 
-      // ---- Simple text body ----
+      // ---- Simple text ----
       doc.fontSize(12);
       const paragraphs = String(planText).split(/\n{2,}/);
 
@@ -208,23 +123,17 @@ module.exports = async function handler(req, res) {
       : [];
 
     const coachProfile = body.coachProfile || null;
-    const workflow = body.workflow || null; // food_scan | body_scan | fitness_plan | null
+    const workflow = body.workflow || null;
 
-    const incomingConversationId = body.conversationId || null;
-    const rawExternalId = body.userExternalId || body.externalId || null;
-    const userEmail = body.userEmail || body.email || null;
-
-    // Fallback external ID so DB can still track anonymous users
-    const externalId =
-      rawExternalId ||
-      `guest:${body.clientId || body.sessionId || randomUUID().toString().slice(0, 12)}`;
+    const conversationId = body.conversationId || null;
+    const userExternalId = body.userExternalId || null;
 
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
     }
 
     // ------------------------------------------------------------------
-    // Format history for OpenAI (strip timestamps etc.)
+    // Format history
     // ------------------------------------------------------------------
     const formattedHistory = history.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
@@ -232,7 +141,7 @@ module.exports = async function handler(req, res) {
     }));
 
     // ------------------------------------------------------------------
-    // System prompt (light coach style hints)
+    // System prompt
     // ------------------------------------------------------------------
     let systemPrompt = `
 You are Exerbud AI, an expert fitness, strength, hypertrophy, mobility, and nutrition coach embedded on the Exerbud website.
@@ -242,7 +151,7 @@ General behavior:
 - Prefer short paragraphs and bullet points.
 - Keep tone friendly and encouraging.
 - Avoid markdown headings like "#", just use plain text and bullets.
-    `.trim();
+`.trim();
 
     if (coachProfile === "strength") {
       systemPrompt += " You focus more on strength training and compound lifts.";
@@ -260,11 +169,12 @@ General behavior:
     ];
 
     // ------------------------------------------------------------------
-    // Attachments → Vision-compatible content
+    // Attachments → Vision
     // ------------------------------------------------------------------
     const imageAttachments = attachments.filter(
       (f) => f?.type?.startsWith("image/") && typeof f.data === "string"
     );
+
     const otherAttachments = attachments.filter(
       (f) => !imageAttachments.includes(f)
     );
@@ -291,14 +201,19 @@ General behavior:
       const parts = [];
 
       if (augmentedUserMessage) {
-        parts.push({ type: "text", text: augmentedUserMessage });
+        parts.push({
+          type: "text",
+          text: augmentedUserMessage,
+        });
       }
 
       for (const img of imageAttachments) {
         const mime = img.type || "image/jpeg";
         parts.push({
           type: "image_url",
-          image_url: { url: `data:${mime};base64,${img.data}` },
+          image_url: {
+            url: `data:${mime};base64,${img.data}`,
+          },
         });
       }
 
@@ -307,43 +222,18 @@ General behavior:
       userContent = augmentedUserMessage || " ";
     }
 
-    messages.push({ role: "user", content: userContent });
-
-    // ------------------------------------------------------------------
-    // DB: ensure User + Conversation + store user message
-    // ------------------------------------------------------------------
-    // Only touch Prisma in the chat path (not PDF / GET)
-    getPrisma();
-
-    const user = await getOrCreateUser({ externalId, email: userEmail });
-    const conversation = await getOrCreateConversation({
-      user,
-      conversationId: incomingConversationId,
-      coachProfile,
-      workflow,
+    messages.push({
+      role: "user",
+      content: userContent,
     });
-
-    const rawUserContentForDB =
-      message || (attachments.length ? "[attachments]" : "");
-
-    if (conversation && rawUserContentForDB) {
-      try {
-        await saveMessage({
-          conversation,
-          user,
-          role: "user",
-          content: rawUserContentForDB,
-        });
-      } catch (e) {
-        console.warn("[Exerbud] Failed to save user message:", e?.message);
-      }
-    }
 
     // ------------------------------------------------------------------
     // OpenAI call
     // ------------------------------------------------------------------
     const OpenAI = (await import("openai")).default;
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const client = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
 
     const model = process.env.EXERBUD_MODEL || "gpt-4.1";
 
@@ -355,33 +245,17 @@ General behavior:
     });
 
     const reply =
-      completion.choices?.[0]?.message?.content?.trim() ||
+      completion?.choices?.[0]?.message?.content?.trim() ||
       "I'm sorry — I couldn't generate a response.";
-
-    // Save assistant message to DB as well
-    if (conversation && reply) {
-      try {
-        await saveMessage({
-          conversation,
-          user: null,
-          role: "assistant",
-          content: reply,
-        });
-      } catch (e) {
-        console.warn(
-          "[Exerbud] Failed to save assistant message:",
-          e?.message
-        );
-      }
-    }
 
     return res.status(200).json({
       reply,
-      conversationId: conversation ? conversation.id : incomingConversationId || randomUUID(),
-      userExternalId: externalId,
+      conversationId: conversationId || randomUUID(),
+      userExternalId: userExternalId || randomUUID(),
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);
+
     if (!res.headersSent) {
       return res.status(500).json({
         error: "Internal server error",
