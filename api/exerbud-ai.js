@@ -3,7 +3,7 @@
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - Optional Prisma persistence for Users / Conversations / Messages / Uploads
+// - Optional Prisma persistence for Users / Conversations / Messages / Uploads / ProgressEvents
 // ======================================================================
 
 const { randomUUID } = require("crypto");
@@ -358,15 +358,69 @@ General behavior:
           }
         }
 
+        // 5) Progress events (drives "This Week at a Glance")
+        const events = [];
+
+        if (workflow === "food_scan" && imageAttachments.length) {
+          // Try to parse calories from the assistant reply
+          let calories = null;
+          const calMatch = reply.match(/(\d{2,5})\s*(?:kcal|calories?)/i);
+          if (calMatch) {
+            const parsed = parseInt(calMatch[1], 10);
+            if (!Number.isNaN(parsed)) {
+              calories = parsed;
+            }
+          }
+
+          events.push({
+            userId: user.id,
+            conversationId: finalConversationId,
+            messageId: lastAssistantMessageId,
+            type: "meal_log",
+            payload: {
+              source: "food_scan",
+              workflow: "food_scan",
+              calories,
+              caloriesTotal: calories,
+            },
+          });
+        } else if (workflow === "body_scan" && imageAttachments.length) {
+          events.push({
+            userId: user.id,
+            conversationId: finalConversationId,
+            messageId: lastAssistantMessageId,
+            type: "body_scan",
+            payload: {
+              source: "body_scan",
+              workflow: "body_scan",
+            },
+          });
+        } else if (workflow === "fitness_plan") {
+          events.push({
+            userId: user.id,
+            conversationId: finalConversationId,
+            messageId: lastAssistantMessageId,
+            type: "workout_plan",
+            payload: {
+              source: "fitness_plan",
+              workflow: "fitness_plan",
+            },
+          });
+        }
+
+        if (events.length) {
+          await prisma.progressEvent.createMany({ data: events });
+        }
+
         console.log(
-          "[Exerbud] Saved messages + uploads to DB for conversation",
+          "[Exerbud] Saved messages + uploads + events for conversation",
           finalConversationId,
           "assistant message id:",
           lastAssistantMessageId
         );
       } catch (err) {
         console.error(
-          "[Exerbud] Failed to persist chat/uploads to DB:",
+          "[Exerbud] Failed to persist chat/uploads/events to DB:",
           err && err.message ? err.message : err
         );
       }
