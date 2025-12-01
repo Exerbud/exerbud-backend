@@ -266,7 +266,6 @@ General behavior:
     const finalConversationId = conversationId || randomUUID();
     const finalUserExternalId = userExternalId || `guest:${randomUUID()}`;
 
-    // will be used in the response so frontend can jump to this reply
     let lastUserMessageId = null;
     let lastAssistantMessageId = null;
 
@@ -338,67 +337,96 @@ General behavior:
 
         lastAssistantMessageId = assistantMsg.id;
 
-        // 4) NEW: Save uploads for dashboard grid
-        if (attachments.length) {
-          const uploadData = attachments.map((file) => {
-            const mime = file.type || "application/octet-stream";
-            // store as data URL so the dashboard can display it directly
-            const url =
-              file.data && typeof file.data === "string"
-                ? `data:${mime};base64,${file.data}`
-                : file.url || "";
+        // 4) Save uploads for dashboard grid (if any)
+        try {
+          if (attachments.length) {
+            const uploadData = attachments.map((file) => {
+              const mime = file.type || "application/octet-stream";
+              const url =
+                file.data && typeof file.data === "string"
+                  ? `data:${mime};base64,${file.data}`
+                  : file.url || "";
 
-            return {
-              userId: user.id,
-              conversationId: finalConversationId,
-              url,
-              type: mime,
-              workflow: workflow || null,
-            };
-          });
+              return {
+                userId: user.id,
+                conversationId: finalConversationId,
+                url,
+                type: mime,
+                workflow: workflow || null,
+              };
+            });
 
-          // createMany ignores extra fields like id/createdAt, Prisma fills them
-          await prisma.upload.createMany({ data: uploadData });
+            await prisma.upload.createMany({ data: uploadData });
 
-          console.log(
-            "[Exerbud] Saved",
-            uploadData.length,
-            "uploads for user",
-            user.id
+            console.log(
+              "[Exerbud] Saved",
+              uploadData.length,
+              "uploads for user",
+              user.id
+            );
+          }
+        } catch (uploadErr) {
+          console.error(
+            "[Exerbud] Failed to save uploads:",
+            uploadErr && uploadErr.message ? uploadErr.message : uploadErr
           );
         }
 
-        // 5) NEW: Progress events for weekly stats
-        const progressTypeMap = {
-          food_scan: "meal_log",
-          body_scan: "body_scan",
-          fitness_plan: "workout_plan",
-        };
+        // 5) Progress events for weekly stats
+        try {
+          const progressTypeMap = {
+            food_scan: "meal_log",
+            body_scan: "body_scan",
+            fitness_plan: "workout_plan",
+          };
 
-        const progressType = progressTypeMap[workflow];
+          const progressType = progressTypeMap[workflow];
 
-        if (progressType) {
-          await prisma.progressEvent.create({
-            data: {
-              userId: user.id,
-              conversationId: finalConversationId,
-              messageId: assistantMsg.id,
-              type: progressType,
-              // For now we just store metadata; stats code will still count events,
-              // and calories will default to 0 until we add structured parsing.
-              payload: {
-                workflow,
-                source: "exerbud-ai",
-                attachmentsCount: attachments.length,
+          if (progressType) {
+            // Try to pull a rough calorie estimate out of the reply for food scans
+            let caloriesEstimate = null;
+            if (workflow === "food_scan" && typeof reply === "string") {
+              const m = reply.match(
+                /(\d{2,4})\s*(kcal|calories?|cals?)/i
+              );
+              if (m && m[1]) {
+                const n = parseInt(m[1], 10);
+                if (!Number.isNaN(n)) caloriesEstimate = n;
+              }
+            }
+
+            const payload = {
+              workflow,
+              source: "exerbud-ai",
+              attachmentsCount: attachments.length,
+            };
+            if (caloriesEstimate != null) {
+              payload.caloriesTotal = caloriesEstimate;
+            }
+
+            await prisma.progressEvent.create({
+              data: {
+                userId: user.id,
+                conversationId: finalConversationId,
+                messageId: assistantMsg.id,
+                type: progressType,
+                payload,
               },
-            },
-          });
+            });
 
-          console.log(
-            "[Exerbud] Created progress event",
-            progressType,
-            "for user",
-            user.id
+            console.log(
+              "[Exerbud] Created progress event",
+              progressType,
+              "for user",
+              user.id,
+              "caloriesTotal:",
+              caloriesEstimate
+            );
+          }
+        } catch (peErr) {
+          console.error(
+            "[Exerbud] Failed to save progress event:",
+            peErr && peErr.message ? peErr.message : peErr
           );
         }
 
@@ -417,15 +445,19 @@ General behavior:
     }
 
     // ------------------------------------------------------------------
-    // Normal HTTP response
+    // Normal HTTP response (with debug hints)
     // ------------------------------------------------------------------
     return res.status(200).json({
       reply,
       conversationId: finalConversationId,
       userExternalId: finalUserExternalId,
-      // new fields for frontend deep-linking
       messageId: lastAssistantMessageId,
       userMessageId: lastUserMessageId,
+      debug: {
+        attachmentsCount: attachments.length,
+        workflowUsed: workflow,
+        prismaEnabled: !!(prisma && process.env.DATABASE_URL),
+      },
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);
