@@ -1,26 +1,21 @@
 {
   "version": 2,
-  "functions": {
-    "api/exerbud-ai.js": {
-      "runtime": "nodejs20.x",
-      "maxDuration": 15
-    },
-    "api/exerbud-ai-stream.js": {
-      "runtime": "edge"
-    },
-    "api/exerbud-pdf.js": {
-      "runtime": "nodejs20.x",
-      "maxDuration": 30
-    },
-    "api/exerbud-account.js": {
-      "runtime": "nodejs20.x",
-      "maxDuration": 10
-    }
-  },
   "routes": [
-    { "src": "/api/exerbud-ai", "dest": "/api/exerbud-ai.js" },
-    { "src": "/api/exerbud-ai-stream", "dest": "/api/exerbud-ai-stream.js" },
-    { "src": "/api/exerbud-pdf", "dest": "/api/exerbud-pdf.js" },
-    { "src": "/api/exerbud-account", "dest": "/api/exerbud-account.js" }
+    {
+      "src": "/api/exerbud-ai",
+      "dest": "/api/exerbud-ai.js"
+    },
+    {
+      "src": "/api/exerbud-ai-stream",
+      "dest": "/api/exerbud-ai-stream.js"
+    },
+    {
+      "src": "/api/exerbud-pdf",
+      "dest": "/api/exerbud-pdf.js"
+    },
+    {
+      "src": "/api/exerbud-account",
+      "dest": "/api/exerbud-account.js"
+    }
   ]
 }
