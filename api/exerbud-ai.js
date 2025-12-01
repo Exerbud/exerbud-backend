@@ -355,25 +355,27 @@ General behavior:
 
         // 4) Save uploads for dashboard grid (THUMBNAIL ONLY)
         if (attachments.length) {
-          const uploadData = attachments.map((file) => {
-            const mime = file.type || "application/octet-stream";
+  const uploadData = attachments.map((file) => {
+    const mime = file.type || "application/octet-stream";
 
-            // Only keep a small thumbnail-sized base64 for DB storage
-            let url = file.url || "";
-            if (file.data && typeof file.data === "string") {
-              const maxChars = 20_000; // ~20 KB of base64
-              const truncated = file.data.slice(0, maxChars);
-              url = `data:${mime};base64,${truncated}`;
-            }
+    // Prefer a real URL if the frontend sent one
+    let url = "";
+    if (typeof file.url === "string" && file.url.length) {
+      url = file.url;
+    } else if (file.data && typeof file.data === "string") {
+      // Fallback: full data URL (no truncation so the image isn't corrupted)
+      url = `data:${mime};base64,${file.data}`;
+    }
 
-            return {
-              userId: user.id,
-              conversationId: finalConversationId,
-              url,
-              type: mime,
-              workflow: workflow || null,
-            };
-          });
+    return {
+      userId: user.id,
+      conversationId: finalConversationId,
+      url,
+      type: mime,
+      workflow: workflow || null,
+    };
+  });
+
 
           try {
             const uploadResult = await prisma.upload.createMany({
