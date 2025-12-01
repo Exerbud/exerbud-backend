@@ -1,7 +1,7 @@
 // ======================================================================
 // EXERBUD ACCOUNT SUMMARY API
 // - Read-only endpoint used by /account dashboard
-// - Returns recent Exerbud AI activity for a logged-in Shopify customer
+// - Returns recent Exerbud AI activity + weekly stats + uploads preview
 // ======================================================================
 
 let prismaInstance = null;
@@ -196,8 +196,7 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
-    // Weekly Progress Summary (for "This Week at a Glance")
-    // - Always returns numbers, defaulting to 0 if no stats
+    // Weekly Progress Summary (real stats using ProgressEvent)
     // --------------------------------------------------------------
     let mealsThisWeek = 0;
     let bodyScansThisWeek = 0;
@@ -206,14 +205,12 @@ module.exports = async function handler(req, res) {
 
     try {
       const now = new Date();
-      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 7 days back
+      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
       const weeklyEvents = await prisma.progressEvent.findMany({
         where: {
           userId: user.id,
-          createdAt: {
-            gte: weekAgo,
-          },
+          createdAt: { gte: weekAgo },
         },
         select: {
           type: true,
@@ -229,10 +226,11 @@ module.exports = async function handler(req, res) {
           case "meal_log":
             mealsThisWeek += 1;
             if (ev.payload && typeof ev.payload === "object") {
+              const p = ev.payload;
               const calories =
-                ev.payload.calories ??
-                ev.payload.kcal ??
-                ev.payload.caloriesTotal ??
+                p.calories ??
+                p.kcal ??
+                p.caloriesTotal ??
                 null;
               if (typeof calories === "number" && !Number.isNaN(calories)) {
                 const dayKey = ev.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
@@ -248,6 +246,7 @@ module.exports = async function handler(req, res) {
             workoutsThisWeek += 1;
             break;
           default:
+            // insight or other; ignore for the simple summary
             break;
         }
       });
@@ -265,7 +264,7 @@ module.exports = async function handler(req, res) {
         "[Exerbud] exerbud-account: DB error loading progress events:",
         err && err.message ? err.message : err
       );
-      // On error, we just leave summary values at 0
+      // leave summary values at 0 on error
     }
 
     const summary = {
@@ -276,7 +275,63 @@ module.exports = async function handler(req, res) {
     };
 
     // --------------------------------------------------------------
-    // Final response
+    // Recent uploads for Instagram-style grid
+    // --------------------------------------------------------------
+    let uploadsPreview = [];
+
+    try {
+      const uploads = await prisma.upload.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: "desc" },
+        take: 9,
+        select: {
+          id: true,
+          url: true,
+          type: true,
+          workflow: true,
+          createdAt: true,
+        },
+      });
+
+      const workflowLabelMap = {
+        food_scan: "Food scan",
+        body_scan: "Body scan",
+        fitness_plan: "Workout plan",
+      };
+
+      uploadsPreview = uploads.map((u) => {
+        const label =
+          workflowLabelMap[u.workflow] ||
+          u.type ||
+          "Upload";
+
+        // Try to guess if it's an image: type like "image/jpeg" OR URL extension
+        const looksLikeImageType =
+          typeof u.type === "string" && u.type.indexOf("image/") === 0;
+        const looksLikeImageUrl =
+          typeof u.url === "string" &&
+          /\.(png|jpe?g|webp|gif|heic)$/i.test(u.url);
+
+        const mimeType = looksLikeImageType ? u.type : null;
+
+        return {
+          id: u.id,
+          url: u.url,
+          mimeType,           // used by frontend to decide image vs file tile
+          fileName: label,    // used as overlay label in the grid
+          createdAt: u.createdAt.toISOString(),
+        };
+      });
+    } catch (err) {
+      console.error(
+        "[Exerbud] exerbud-account: DB error loading uploads:",
+        err && err.message ? err.message : err
+      );
+      uploadsPreview = [];
+    }
+
+    // --------------------------------------------------------------
+    // Final response: always hasData=true once user is resolved
     // --------------------------------------------------------------
     return res.status(200).json({
       hasData: true,
@@ -288,7 +343,8 @@ module.exports = async function handler(req, res) {
         content: m.content,
         createdAt: m.createdAt.toISOString(),
       })),
-      summary, // 👈 new weekly stats for dashboard
+      summary,
+      uploadsPreview,
     });
   } catch (error) {
     console.error("Exerbud account API error (top-level):", error);
