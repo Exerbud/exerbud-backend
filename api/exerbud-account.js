@@ -4,14 +4,11 @@
 // - Returns recent Exerbud AI activity for a logged-in Shopify customer
 // ======================================================================
 
-const { URL } = require("url");
-
 // ----------------------------------------------------------------------
 // Prisma client (optional, same pattern as exerbud-ai.js)
 // ----------------------------------------------------------------------
 let prisma = null;
 try {
-  // This will throw if @prisma/client is not installed / generated
   const { PrismaClient } = require("@prisma/client");
   prisma = new PrismaClient();
   console.log("[Exerbud] Prisma client loaded in /api/exerbud-account");
@@ -41,24 +38,20 @@ module.exports = async function handler(req, res) {
     }
 
     // ------------------------------------------------------------------
-    // Parse query params: externalId & email
+    // Parse query params: externalId & email (use req.query on Vercel)
     // ------------------------------------------------------------------
-    let externalId = null;
-    let email = null;
+    const q = req.query || {};
+    const externalIdRaw = q.externalId;
+    const emailRaw = q.email;
 
-    try {
-      const urlObj = new URL(
-        req.url,
-        `http://${req.headers.host || "localhost"}`
-      );
-      externalId = urlObj.searchParams.get("externalId");
-      email = urlObj.searchParams.get("email");
-    } catch (e) {
-      console.warn(
-        "[Exerbud] Failed to parse URL in exerbud-account:",
-        e?.message || e
-      );
-    }
+    const externalId =
+      typeof externalIdRaw === "string" && externalIdRaw.trim()
+        ? externalIdRaw.trim()
+        : null;
+    const email =
+      typeof emailRaw === "string" && emailRaw.trim()
+        ? emailRaw.trim()
+        : null;
 
     if (!externalId && !email) {
       // No identity info; nothing to show (but still 200)
@@ -82,16 +75,16 @@ module.exports = async function handler(req, res) {
     }
 
     // ------------------------------------------------------------------
-    // Prisma queries wrapped in their own try/catch
+    // Look up user by externalId OR email
     // ------------------------------------------------------------------
     let user;
     try {
-      const whereClauses = [];
-      if (externalId) whereClauses.push({ externalId });
-      if (email) whereClauses.push({ email });
+      const orClauses = [];
+      if (externalId) orClauses.push({ externalId });
+      if (email) orClauses.push({ email });
 
       user = await prisma.user.findFirst({
-        where: { OR: whereClauses },
+        where: { OR: orClauses },
         select: { id: true },
       });
     } catch (err) {
@@ -112,6 +105,9 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    // ------------------------------------------------------------------
+    // Load total + recent messages for this user
+    // ------------------------------------------------------------------
     let totalMessages = 0;
     let recentMessages = [];
 
@@ -193,8 +189,7 @@ module.exports = async function handler(req, res) {
   } catch (error) {
     console.error("Exerbud account API error (top-level):", error);
     if (!res.headersSent) {
-      // Even here: respond 200 with a soft error so the frontend
-      // doesn’t blow up with a network error.
+      // Still respond 200 with soft error so frontend doesn't get a network error
       return res.status(200).json({
         hasData: false,
         reason: "unexpected_error",
