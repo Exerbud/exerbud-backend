@@ -6,12 +6,13 @@
 // - Optional Prisma persistence for Users / Conversations / Messages
 //   + Uploads + ProgressEvent for dashboard stats
 //   + Debug fields so we can verify attachments + DB writes
+//   + Thumbnail-only uploads to keep DB rows small
 // ======================================================================
 
 const { randomUUID } = require("crypto");
 
 // Bump this when you deploy so you can confirm the correct version
-const EXERBUD_API_VERSION = "2024-12-01-uploads-v2";
+const EXERBUD_API_VERSION = "2024-12-01-uploads-v3";
 
 // Logo URL for PDF header (optional)
 const EXERBUD_LOGO_URL =
@@ -352,14 +353,18 @@ General behavior:
 
         lastAssistantMessageId = assistantMsg.id;
 
-        // 4) Save uploads for dashboard grid
+        // 4) Save uploads for dashboard grid (THUMBNAIL ONLY)
         if (attachments.length) {
           const uploadData = attachments.map((file) => {
             const mime = file.type || "application/octet-stream";
-            const url =
-              file.data && typeof file.data === "string"
-                ? `data:${mime};base64,${file.data}`
-                : file.url || "";
+
+            // Only keep a small thumbnail-sized base64 for DB storage
+            let url = file.url || "";
+            if (file.data && typeof file.data === "string") {
+              const maxChars = 20_000; // ~20 KB of base64
+              const truncated = file.data.slice(0, maxChars);
+              url = `data:${mime};base64,${truncated}`;
+            }
 
             return {
               userId: user.id,
@@ -370,19 +375,27 @@ General behavior:
             };
           });
 
-          const uploadResult = await prisma.upload.createMany({
-            data: uploadData,
-          });
+          try {
+            const uploadResult = await prisma.upload.createMany({
+              data: uploadData,
+            });
 
-          // uploadResult.count is how many rows were written
-          uploadsSaved = uploadResult.count || uploadData.length;
+            uploadsSaved = uploadResult.count || 0;
 
-          console.log(
-            "[Exerbud] Saved",
-            uploadsSaved,
-            "uploads for user",
-            user.id
-          );
+            console.log(
+              "[Exerbud] Saved",
+              uploadsSaved,
+              "thumbnail uploads for user",
+              user.id
+            );
+          } catch (uploadErr) {
+            console.error(
+              "[Exerbud] UPLOAD SAVE FAILED:",
+              uploadErr && uploadErr.message
+                ? uploadErr.message
+                : uploadErr
+            );
+          }
         }
 
         // 5) Progress events for weekly stats
@@ -395,28 +408,35 @@ General behavior:
         const progressType = progressTypeMap[workflow];
 
         if (progressType) {
-          await prisma.progressEvent.create({
-            data: {
-              userId: user.id,
-              conversationId: finalConversationId,
-              messageId: assistantMsg.id,
-              type: progressType,
-              payload: {
-                workflow,
-                source: "exerbud-ai",
-                attachmentsCount: attachments.length,
+          try {
+            await prisma.progressEvent.create({
+              data: {
+                userId: user.id,
+                conversationId: finalConversationId,
+                messageId: assistantMsg.id,
+                type: progressType,
+                payload: {
+                  workflow,
+                  source: "exerbud-ai",
+                  attachmentsCount: attachments.length,
+                },
               },
-            },
-          });
+            });
 
-          progressEventCreated = true;
+            progressEventCreated = true;
 
-          console.log(
-            "[Exerbud] Created progress event",
-            progressType,
-            "for user",
-            user.id
-          );
+            console.log(
+              "[Exerbud] Created progress event",
+              progressType,
+              "for user",
+              user.id
+            );
+          } catch (peErr) {
+            console.error(
+              "[Exerbud] PROGRESS EVENT SAVE FAILED:",
+              peErr && peErr.message ? peErr.message : peErr
+            );
+          }
         }
 
         console.log(
