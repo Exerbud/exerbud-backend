@@ -4,25 +4,32 @@
 // - Returns recent Exerbud AI activity for a logged-in Shopify customer
 // ======================================================================
 
-// ----------------------------------------------------------------------
-// Optional Prisma client
-// ----------------------------------------------------------------------
-let prisma = null;
-try {
-  const { PrismaClient } = require("@prisma/client");
-  prisma = new PrismaClient();
-  console.log("[Exerbud] Prisma client loaded in /api/exerbud-account");
-} catch (err) {
-  console.error(
-    "[Exerbud] Failed to load PrismaClient in /api/exerbud-account:",
-    err && err.message ? err.message : err
-  );
-  prisma = null;
+let prismaInstance = null;
+
+function getPrisma() {
+  if (prismaInstance) return prismaInstance;
+  try {
+    const { PrismaClient } = require("@prisma/client");
+    prismaInstance = new PrismaClient();
+    console.log("[Exerbud] Prisma client loaded in /api/exerbud-account");
+  } catch (err) {
+    console.error(
+      "[Exerbud] Failed to load PrismaClient in /api/exerbud-account:",
+      err && err.message ? err.message : err
+    );
+    prismaInstance = null;
+  }
+  return prismaInstance;
 }
 
 module.exports = async function handler(req, res) {
-  // Basic CORS for the Shopify storefront
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  // ------------------------------------------------------------------
+  // CORS: allow your storefront origin
+  // ------------------------------------------------------------------
+  const allowedOrigin = "https://exerbud.com";
+
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Cache-Control", "no-store");
@@ -69,8 +76,10 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
-    // If Prisma isn't available, bail out gracefully
+    // Prisma
     // --------------------------------------------------------------
+    const prisma = getPrisma();
+
     if (!prisma || !process.env.DATABASE_URL) {
       console.log(
         "[Exerbud] exerbud-account: prisma/DATABASE_URL missing, persistence disabled"
