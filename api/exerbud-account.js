@@ -5,7 +5,7 @@
 // ======================================================================
 
 // ----------------------------------------------------------------------
-// Prisma client (optional, same pattern as exerbud-ai.js)
+// Optional Prisma client
 // ----------------------------------------------------------------------
 let prisma = null;
 try {
@@ -21,10 +21,11 @@ try {
 }
 
 module.exports = async function handler(req, res) {
-  // --- CORS (for Shopify storefront) ---
+  // Basic CORS for the Shopify storefront
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Cache-Control", "no-store");
 
   try {
     // Preflight
@@ -37,36 +38,42 @@ module.exports = async function handler(req, res) {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // ------------------------------------------------------------------
-    // Parse query params: externalId & email (use req.query on Vercel)
-    // ------------------------------------------------------------------
-    const q = req.query || {};
-    const externalIdRaw = q.externalId;
-    const emailRaw = q.email;
+    // --------------------------------------------------------------
+    // Parse query params safely from req.url
+    // --------------------------------------------------------------
+    let externalId = null;
+    let email = null;
 
-    const externalId =
-      typeof externalIdRaw === "string" && externalIdRaw.trim()
-        ? externalIdRaw.trim()
-        : null;
-    const email =
-      typeof emailRaw === "string" && emailRaw.trim()
-        ? emailRaw.trim()
-        : null;
+    try {
+      const urlObj = new URL(
+        req.url,
+        `http://${req.headers.host || "localhost"}`
+      );
+      externalId = urlObj.searchParams.get("externalId");
+      email = urlObj.searchParams.get("email");
+    } catch (e) {
+      console.error(
+        "[Exerbud] Failed to parse URL in exerbud-account:",
+        e && e.message ? e.message : e
+      );
+    }
 
     if (!externalId && !email) {
-      // No identity info; nothing to show (but still 200)
+      console.log(
+        "[Exerbud] exerbud-account: missing identity (no externalId or email)"
+      );
       return res.status(200).json({
         hasData: false,
         reason: "missing_identity",
       });
     }
 
-    // ------------------------------------------------------------------
-    // If Prisma isn't available, just return empty summary
-    // ------------------------------------------------------------------
+    // --------------------------------------------------------------
+    // If Prisma isn't available, bail out gracefully
+    // --------------------------------------------------------------
     if (!prisma || !process.env.DATABASE_URL) {
       console.log(
-        "[Exerbud] Skipping DB lookup in /api/exerbud-account (no prisma or DATABASE_URL)"
+        "[Exerbud] exerbud-account: prisma/DATABASE_URL missing, persistence disabled"
       );
       return res.status(200).json({
         hasData: false,
@@ -74,22 +81,22 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // ------------------------------------------------------------------
-    // Look up user by externalId OR email
-    // ------------------------------------------------------------------
-    let user;
+    // --------------------------------------------------------------
+    // Look up the user
+    // --------------------------------------------------------------
+    let user = null;
     try {
-      const orClauses = [];
-      if (externalId) orClauses.push({ externalId });
-      if (email) orClauses.push({ email });
+      const whereClauses = [];
+      if (externalId) whereClauses.push({ externalId });
+      if (email) whereClauses.push({ email });
 
       user = await prisma.user.findFirst({
-        where: { OR: orClauses },
+        where: { OR: whereClauses },
         select: { id: true },
       });
     } catch (err) {
       console.error(
-        "[Exerbud] DB error when looking up user in exerbud-account:",
+        "[Exerbud] exerbud-account: DB error looking up user:",
         err && err.message ? err.message : err
       );
       return res.status(200).json({
@@ -99,15 +106,19 @@ module.exports = async function handler(req, res) {
     }
 
     if (!user) {
+      console.log(
+        "[Exerbud] exerbud-account: user not found for",
+        externalId || email
+      );
       return res.status(200).json({
         hasData: false,
         reason: "user_not_found",
       });
     }
 
-    // ------------------------------------------------------------------
-    // Load total + recent messages for this user
-    // ------------------------------------------------------------------
+    // --------------------------------------------------------------
+    // Load messages for that user
+    // --------------------------------------------------------------
     let totalMessages = 0;
     let recentMessages = [];
 
@@ -138,7 +149,7 @@ module.exports = async function handler(req, res) {
       }
     } catch (err) {
       console.error(
-        "[Exerbud] DB error when loading messages in exerbud-account:",
+        "[Exerbud] exerbud-account: DB error loading messages:",
         err && err.message ? err.message : err
       );
       return res.status(200).json({
@@ -150,6 +161,7 @@ module.exports = async function handler(req, res) {
     if (!totalMessages || recentMessages.length === 0) {
       return res.status(200).json({
         hasData: false,
+        reason: "no_messages",
         totalMessages: 0,
         recentMessages: [],
       });
@@ -160,7 +172,7 @@ module.exports = async function handler(req, res) {
       ? last.createdAt.toISOString()
       : null;
 
-    let lastMessageAtHuman = null;
+    let lastMessageAtHuman = lastMessageAtIso;
     if (last?.createdAt) {
       try {
         lastMessageAtHuman = last.createdAt.toLocaleString("en-US", {
@@ -171,7 +183,7 @@ module.exports = async function handler(req, res) {
           minute: "2-digit",
         });
       } catch {
-        lastMessageAtHuman = lastMessageAtIso;
+        // keep ISO
       }
     }
 
@@ -189,7 +201,6 @@ module.exports = async function handler(req, res) {
   } catch (error) {
     console.error("Exerbud account API error (top-level):", error);
     if (!res.headersSent) {
-      // Still respond 200 with soft error so frontend doesn't get a network error
       return res.status(200).json({
         hasData: false,
         reason: "unexpected_error",
