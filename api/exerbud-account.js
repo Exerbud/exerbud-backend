@@ -167,35 +167,117 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    if (!totalMessages || recentMessages.length === 0) {
-      return res.status(200).json({
-        hasData: false,
-        reason: "no_messages",
-        totalMessages: 0,
-        recentMessages: [],
-      });
-    }
+    // --------------------------------------------------------------
+    // Derive last message timestamps (may be null if no messages)
+    // --------------------------------------------------------------
+    let lastMessageAtIso = null;
+    let lastMessageAtHuman = null;
 
-    const last = recentMessages[0];
-    const lastMessageAtIso = last?.createdAt
-      ? last.createdAt.toISOString()
-      : null;
-
-    let lastMessageAtHuman = lastMessageAtIso;
-    if (last?.createdAt) {
-      try {
-        lastMessageAtHuman = last.createdAt.toLocaleString("en-US", {
-          month: "short",
-          day: "2-digit",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        });
-      } catch {
-        // keep ISO
+    if (recentMessages.length > 0) {
+      const last = recentMessages[0];
+      if (last && last.createdAt) {
+        try {
+          lastMessageAtIso = last.createdAt.toISOString();
+        } catch {
+          lastMessageAtIso = null;
+        }
+        try {
+          lastMessageAtHuman = last.createdAt.toLocaleString("en-US", {
+            month: "short",
+            day: "2-digit",
+            year: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+        } catch {
+          lastMessageAtHuman = lastMessageAtIso;
+        }
       }
     }
 
+    // --------------------------------------------------------------
+    // Weekly Progress Summary (for "This Week at a Glance")
+    // - Always returns numbers, defaulting to 0 if no stats
+    // --------------------------------------------------------------
+    let mealsThisWeek = 0;
+    let bodyScansThisWeek = 0;
+    let workoutsThisWeek = 0;
+    let avgCaloriesPerDay = 0;
+
+    try {
+      const now = new Date();
+      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 7 days back
+
+      const weeklyEvents = await prisma.progressEvent.findMany({
+        where: {
+          userId: user.id,
+          createdAt: {
+            gte: weekAgo,
+          },
+        },
+        select: {
+          type: true,
+          createdAt: true,
+          payload: true,
+        },
+      });
+
+      const caloriesByDay = {};
+
+      weeklyEvents.forEach((ev) => {
+        switch (ev.type) {
+          case "meal_log":
+            mealsThisWeek += 1;
+            if (ev.payload && typeof ev.payload === "object") {
+              const calories =
+                ev.payload.calories ??
+                ev.payload.kcal ??
+                ev.payload.caloriesTotal ??
+                null;
+              if (typeof calories === "number" && !Number.isNaN(calories)) {
+                const dayKey = ev.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
+                caloriesByDay[dayKey] =
+                  (caloriesByDay[dayKey] || 0) + calories;
+              }
+            }
+            break;
+          case "body_scan":
+            bodyScansThisWeek += 1;
+            break;
+          case "workout_plan":
+            workoutsThisWeek += 1;
+            break;
+          default:
+            break;
+        }
+      });
+
+      const dayKeys = Object.keys(caloriesByDay);
+      if (dayKeys.length > 0) {
+        const totalCalories = dayKeys.reduce(
+          (sum, day) => sum + caloriesByDay[day],
+          0
+        );
+        avgCaloriesPerDay = Math.round(totalCalories / dayKeys.length);
+      }
+    } catch (err) {
+      console.error(
+        "[Exerbud] exerbud-account: DB error loading progress events:",
+        err && err.message ? err.message : err
+      );
+      // On error, we just leave summary values at 0
+    }
+
+    const summary = {
+      mealsThisWeek,
+      bodyScansThisWeek,
+      workoutsThisWeek,
+      avgCaloriesPerDay,
+    };
+
+    // --------------------------------------------------------------
+    // Final response
+    // --------------------------------------------------------------
     return res.status(200).json({
       hasData: true,
       totalMessages,
@@ -206,6 +288,7 @@ module.exports = async function handler(req, res) {
         content: m.content,
         createdAt: m.createdAt.toISOString(),
       })),
+      summary, // 👈 new weekly stats for dashboard
     });
   } catch (error) {
     console.error("Exerbud account API error (top-level):", error);
