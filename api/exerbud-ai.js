@@ -3,7 +3,7 @@
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - Optional Prisma persistence for Users / Conversations / Messages
+// - Optional Prisma persistence for Users / Conversations / Messages / Uploads
 // ======================================================================
 
 const { randomUUID } = require("crypto");
@@ -338,15 +338,35 @@ General behavior:
 
         lastAssistantMessageId = assistantMsg.id;
 
+        // 4) Save uploads (images + files) for dashboard "Recent uploads"
+        if (attachments.length) {
+          const uploadRows = attachments
+            .filter((f) => typeof f.data === "string" && f.data.length > 0)
+            .map((f) => {
+              const mime = f.type || "application/octet-stream";
+              return {
+                userId: user.id,
+                conversationId: finalConversationId,
+                url: `data:${mime};base64,${f.data}`, // used directly in <img src=""> or file link
+                type: mime,
+                workflow: workflow || null, // food_scan / body_scan / fitness_plan / null
+              };
+            });
+
+          if (uploadRows.length) {
+            await prisma.upload.createMany({ data: uploadRows });
+          }
+        }
+
         console.log(
-          "[Exerbud] Saved messages to DB for conversation",
+          "[Exerbud] Saved messages + uploads to DB for conversation",
           finalConversationId,
           "assistant message id:",
           lastAssistantMessageId
         );
       } catch (err) {
         console.error(
-          "[Exerbud] Failed to persist chat to DB:",
+          "[Exerbud] Failed to persist chat/uploads to DB:",
           err && err.message ? err.message : err
         );
       }
