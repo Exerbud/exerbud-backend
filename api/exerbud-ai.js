@@ -266,6 +266,10 @@ General behavior:
     const finalConversationId = conversationId || randomUUID();
     const finalUserExternalId = userExternalId || `guest:${randomUUID()}`;
 
+    // will be used in the response so frontend can jump to this reply
+    let lastUserMessageId = null;
+    let lastAssistantMessageId = null;
+
     if (!prisma) {
       console.log(
         "[Exerbud] Skipping DB save: prisma is null in /api/exerbud-ai"
@@ -305,13 +309,13 @@ General behavior:
           },
         });
 
-        // 3) Insert messages (user + assistant)
+        // 3) Insert messages (user + assistant) and capture IDs
         if (message || attachments.length) {
           const userContentForDb =
             message ||
             (attachments.length ? "[attachments]" : "[empty message]");
 
-          await prisma.message.create({
+          const userMsg = await prisma.message.create({
             data: {
               conversationId: finalConversationId,
               userId: user.id,
@@ -319,9 +323,11 @@ General behavior:
               content: userContentForDb,
             },
           });
+
+          lastUserMessageId = userMsg.id;
         }
 
-        await prisma.message.create({
+        const assistantMsg = await prisma.message.create({
           data: {
             conversationId: finalConversationId,
             userId: null,
@@ -330,9 +336,13 @@ General behavior:
           },
         });
 
+        lastAssistantMessageId = assistantMsg.id;
+
         console.log(
           "[Exerbud] Saved messages to DB for conversation",
-          finalConversationId
+          finalConversationId,
+          "assistant message id:",
+          lastAssistantMessageId
         );
       } catch (err) {
         console.error(
@@ -349,6 +359,9 @@ General behavior:
       reply,
       conversationId: finalConversationId,
       userExternalId: finalUserExternalId,
+      // new fields for frontend deep-linking
+      messageId: lastAssistantMessageId,
+      userMessageId: lastUserMessageId,
     });
   } catch (error) {
     console.error("Exerbud AI backend error (top-level):", error);

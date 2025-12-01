@@ -290,6 +290,7 @@ module.exports = async function handler(req, res) {
           type: true,
           workflow: true,
           createdAt: true,
+          conversationId: true,
         },
       });
 
@@ -299,29 +300,70 @@ module.exports = async function handler(req, res) {
         fitness_plan: "Workout plan",
       };
 
-      uploadsPreview = uploads.map((u) => {
-        const label =
-          workflowLabelMap[u.workflow] ||
-          u.type ||
-          "Upload";
+      uploadsPreview = await Promise.all(
+        uploads.map(async (u) => {
+          let messageId = null;
 
-        // Try to guess if it's an image: type like "image/jpeg" OR URL extension
-        const looksLikeImageType =
-          typeof u.type === "string" && u.type.indexOf("image/") === 0;
-        const looksLikeImageUrl =
-          typeof u.url === "string" &&
-          /\.(png|jpe?g|webp|gif|heic)$/i.test(u.url);
+          // Try to find the closest relevant message in that conversation
+          try {
+            if (u.conversationId) {
+              // Prefer the first assistant message *after* the upload
+              let msg = await prisma.message.findFirst({
+                where: {
+                  conversationId: u.conversationId,
+                  role: "assistant",
+                  createdAt: { gte: u.createdAt },
+                },
+                orderBy: { createdAt: "asc" },
+                select: { id: true },
+              });
 
-        const mimeType = looksLikeImageType ? u.type : null;
+              // Fallback: the last message at or before the upload time
+              if (!msg) {
+                msg = await prisma.message.findFirst({
+                  where: {
+                    conversationId: u.conversationId,
+                    createdAt: { lte: u.createdAt },
+                  },
+                  orderBy: { createdAt: "desc" },
+                  select: { id: true },
+                });
+              }
 
-        return {
-          id: u.id,
-          url: u.url,
-          mimeType,           // used by frontend to decide image vs file tile
-          fileName: label,    // used as overlay label in the grid
-          createdAt: u.createdAt.toISOString(),
-        };
-      });
+              messageId = msg?.id || null;
+            }
+          } catch (e) {
+            console.error(
+              "[Exerbud] Failed to attach messageId to upload:",
+              e && e.message ? e.message : e
+            );
+          }
+
+          const label =
+            workflowLabelMap[u.workflow] ||
+            u.type ||
+            "Upload";
+
+          // Guess if it's an image: MIME type or URL extension
+          const looksLikeImageType =
+            typeof u.type === "string" && u.type.indexOf("image/") === 0;
+          const looksLikeImageUrl =
+            typeof u.url === "string" &&
+            /\.(png|jpe?g|webp|gif|heic)$/i.test(u.url);
+
+          const looksLikeImage = looksLikeImageType || looksLikeImageUrl;
+          const mimeType = looksLikeImage ? (u.type || "image/*") : null;
+
+          return {
+            id: u.id,
+            url: u.url,
+            messageId,
+            mimeType,         // used by frontend to decide image vs file tile
+            fileName: label,  // used as overlay label in the grid
+            createdAt: u.createdAt.toISOString(),
+          };
+        })
+      );
     } catch (err) {
       console.error(
         "[Exerbud] exerbud-account: DB error loading uploads:",
