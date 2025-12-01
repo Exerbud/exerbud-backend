@@ -5,9 +5,13 @@
 // - Vision support via attachments (image_url)
 // - Optional Prisma persistence for Users / Conversations / Messages
 //   + Uploads + ProgressEvent for dashboard stats
+//   + Debug fields so we can verify attachments + DB writes
 // ======================================================================
 
 const { randomUUID } = require("crypto");
+
+// Bump this when you deploy so you can confirm the correct version
+const EXERBUD_API_VERSION = "2024-12-01-uploads-v2";
 
 // Logo URL for PDF header (optional)
 const EXERBUD_LOGO_URL =
@@ -46,6 +50,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         ok: true,
         message: "Exerbud AI backend is alive",
+        version: EXERBUD_API_VERSION,
       });
     }
 
@@ -149,6 +154,14 @@ module.exports = async function handler(req, res) {
     if (!message && !attachments.length) {
       return res.status(400).json({ error: "Missing message" });
     }
+
+    const attachmentsCount = attachments.length;
+    console.log(
+      "[Exerbud] Incoming request -> workflow:",
+      workflow,
+      "attachmentsCount:",
+      attachmentsCount
+    );
 
     // Ensure we always have some external ID, even if frontend forgot
     if (!userExternalId) {
@@ -268,6 +281,8 @@ General behavior:
 
     let lastUserMessageId = null;
     let lastAssistantMessageId = null;
+    let uploadsSaved = 0;
+    let progressEventCreated = false;
 
     if (!prisma) {
       console.log(
@@ -337,96 +352,70 @@ General behavior:
 
         lastAssistantMessageId = assistantMsg.id;
 
-        // 4) Save uploads for dashboard grid (if any)
-        try {
-          if (attachments.length) {
-            const uploadData = attachments.map((file) => {
-              const mime = file.type || "application/octet-stream";
-              const url =
-                file.data && typeof file.data === "string"
-                  ? `data:${mime};base64,${file.data}`
-                  : file.url || "";
+        // 4) Save uploads for dashboard grid
+        if (attachments.length) {
+          const uploadData = attachments.map((file) => {
+            const mime = file.type || "application/octet-stream";
+            const url =
+              file.data && typeof file.data === "string"
+                ? `data:${mime};base64,${file.data}`
+                : file.url || "";
 
-              return {
-                userId: user.id,
-                conversationId: finalConversationId,
-                url,
-                type: mime,
-                workflow: workflow || null,
-              };
-            });
+            return {
+              userId: user.id,
+              conversationId: finalConversationId,
+              url,
+              type: mime,
+              workflow: workflow || null,
+            };
+          });
 
-            await prisma.upload.createMany({ data: uploadData });
+          const uploadResult = await prisma.upload.createMany({
+            data: uploadData,
+          });
 
-            console.log(
-              "[Exerbud] Saved",
-              uploadData.length,
-              "uploads for user",
-              user.id
-            );
-          }
-        } catch (uploadErr) {
-          console.error(
-            "[Exerbud] Failed to save uploads:",
-            uploadErr && uploadErr.message ? uploadErr.message : uploadErr
+          // uploadResult.count is how many rows were written
+          uploadsSaved = uploadResult.count || uploadData.length;
+
+          console.log(
+            "[Exerbud] Saved",
+            uploadsSaved,
+            "uploads for user",
+            user.id
           );
         }
 
         // 5) Progress events for weekly stats
-        try {
-          const progressTypeMap = {
-            food_scan: "meal_log",
-            body_scan: "body_scan",
-            fitness_plan: "workout_plan",
-          };
+        const progressTypeMap = {
+          food_scan: "meal_log",
+          body_scan: "body_scan",
+          fitness_plan: "workout_plan",
+        };
 
-          const progressType = progressTypeMap[workflow];
+        const progressType = progressTypeMap[workflow];
 
-          if (progressType) {
-            // Try to pull a rough calorie estimate out of the reply for food scans
-            let caloriesEstimate = null;
-            if (workflow === "food_scan" && typeof reply === "string") {
-              const m = reply.match(
-                /(\d{2,4})\s*(kcal|calories?|cals?)/i
-              );
-              if (m && m[1]) {
-                const n = parseInt(m[1], 10);
-                if (!Number.isNaN(n)) caloriesEstimate = n;
-              }
-            }
-
-            const payload = {
-              workflow,
-              source: "exerbud-ai",
-              attachmentsCount: attachments.length,
-            };
-            if (caloriesEstimate != null) {
-              payload.caloriesTotal = caloriesEstimate;
-            }
-
-            await prisma.progressEvent.create({
-              data: {
-                userId: user.id,
-                conversationId: finalConversationId,
-                messageId: assistantMsg.id,
-                type: progressType,
-                payload,
+        if (progressType) {
+          await prisma.progressEvent.create({
+            data: {
+              userId: user.id,
+              conversationId: finalConversationId,
+              messageId: assistantMsg.id,
+              type: progressType,
+              payload: {
+                workflow,
+                source: "exerbud-ai",
+                attachmentsCount: attachments.length,
               },
-            });
+            },
+          });
 
-            console.log(
-              "[Exerbud] Created progress event",
-              progressType,
-              "for user",
-              user.id,
-              "caloriesTotal:",
-              caloriesEstimate
-            );
-          }
-        } catch (peErr) {
-          console.error(
-            "[Exerbud] Failed to save progress event:",
-            peErr && peErr.message ? peErr.message : peErr
+          progressEventCreated = true;
+
+          console.log(
+            "[Exerbud] Created progress event",
+            progressType,
+            "for user",
+            user.id
           );
         }
 
@@ -445,7 +434,7 @@ General behavior:
     }
 
     // ------------------------------------------------------------------
-    // Normal HTTP response (with debug hints)
+    // Normal HTTP response
     // ------------------------------------------------------------------
     return res.status(200).json({
       reply,
@@ -453,10 +442,13 @@ General behavior:
       userExternalId: finalUserExternalId,
       messageId: lastAssistantMessageId,
       userMessageId: lastUserMessageId,
+      version: EXERBUD_API_VERSION,
+      // debug info so we can see what's really happening
       debug: {
-        attachmentsCount: attachments.length,
-        workflowUsed: workflow,
-        prismaEnabled: !!(prisma && process.env.DATABASE_URL),
+        workflowReceived: workflow,
+        attachmentsCount,
+        uploadsSaved,
+        progressEventCreated,
       },
     });
   } catch (error) {
@@ -465,6 +457,7 @@ General behavior:
       return res.status(500).json({
         error: "Internal server error",
         details: error?.message || "Unknown error",
+        version: EXERBUD_API_VERSION,
       });
     }
   }
