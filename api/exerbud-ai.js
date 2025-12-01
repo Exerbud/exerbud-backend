@@ -3,7 +3,8 @@
 // - CORS + GET healthcheck
 // - PDF Export (centered logo)
 // - Vision support via attachments (image_url)
-// - Optional Prisma persistence for Users / Conversations / Messages / Uploads / ProgressEvents
+// - Optional Prisma persistence for Users / Conversations / Messages
+//   + Uploads + ProgressEvent for dashboard stats
 // ======================================================================
 
 const { randomUUID } = require("crypto");
@@ -17,7 +18,6 @@ const EXERBUD_LOGO_URL =
 // ----------------------------------------------------------------------
 let prisma = null;
 try {
-  // This will throw if @prisma/client is not installed correctly
   const { PrismaClient } = require("@prisma/client");
   prisma = new PrismaClient();
   console.log("[Exerbud] Prisma client loaded in /api/exerbud-ai");
@@ -338,89 +338,79 @@ General behavior:
 
         lastAssistantMessageId = assistantMsg.id;
 
-        // 4) Save uploads (images + files) for dashboard "Recent uploads"
+        // 4) NEW: Save uploads for dashboard grid
         if (attachments.length) {
-          const uploadRows = attachments
-            .filter((f) => typeof f.data === "string" && f.data.length > 0)
-            .map((f) => {
-              const mime = f.type || "application/octet-stream";
-              return {
-                userId: user.id,
-                conversationId: finalConversationId,
-                url: `data:${mime};base64,${f.data}`, // used directly in <img src=""> or file link
-                type: mime,
-                workflow: workflow || null, // food_scan / body_scan / fitness_plan / null
-              };
-            });
+          const uploadData = attachments.map((file) => {
+            const mime = file.type || "application/octet-stream";
+            // store as data URL so the dashboard can display it directly
+            const url =
+              file.data && typeof file.data === "string"
+                ? `data:${mime};base64,${file.data}`
+                : file.url || "";
 
-          if (uploadRows.length) {
-            await prisma.upload.createMany({ data: uploadRows });
-          }
+            return {
+              userId: user.id,
+              conversationId: finalConversationId,
+              url,
+              type: mime,
+              workflow: workflow || null,
+            };
+          });
+
+          // createMany ignores extra fields like id/createdAt, Prisma fills them
+          await prisma.upload.createMany({ data: uploadData });
+
+          console.log(
+            "[Exerbud] Saved",
+            uploadData.length,
+            "uploads for user",
+            user.id
+          );
         }
 
-        // 5) Progress events (drives "This Week at a Glance")
-        const events = [];
+        // 5) NEW: Progress events for weekly stats
+        const progressTypeMap = {
+          food_scan: "meal_log",
+          body_scan: "body_scan",
+          fitness_plan: "workout_plan",
+        };
 
-        if (workflow === "food_scan" && imageAttachments.length) {
-          // Try to parse calories from the assistant reply
-          let calories = null;
-          const calMatch = reply.match(/(\d{2,5})\s*(?:kcal|calories?)/i);
-          if (calMatch) {
-            const parsed = parseInt(calMatch[1], 10);
-            if (!Number.isNaN(parsed)) {
-              calories = parsed;
-            }
-          }
+        const progressType = progressTypeMap[workflow];
 
-          events.push({
-            userId: user.id,
-            conversationId: finalConversationId,
-            messageId: lastAssistantMessageId,
-            type: "meal_log",
-            payload: {
-              source: "food_scan",
-              workflow: "food_scan",
-              calories,
-              caloriesTotal: calories,
+        if (progressType) {
+          await prisma.progressEvent.create({
+            data: {
+              userId: user.id,
+              conversationId: finalConversationId,
+              messageId: assistantMsg.id,
+              type: progressType,
+              // For now we just store metadata; stats code will still count events,
+              // and calories will default to 0 until we add structured parsing.
+              payload: {
+                workflow,
+                source: "exerbud-ai",
+                attachmentsCount: attachments.length,
+              },
             },
           });
-        } else if (workflow === "body_scan" && imageAttachments.length) {
-          events.push({
-            userId: user.id,
-            conversationId: finalConversationId,
-            messageId: lastAssistantMessageId,
-            type: "body_scan",
-            payload: {
-              source: "body_scan",
-              workflow: "body_scan",
-            },
-          });
-        } else if (workflow === "fitness_plan") {
-          events.push({
-            userId: user.id,
-            conversationId: finalConversationId,
-            messageId: lastAssistantMessageId,
-            type: "workout_plan",
-            payload: {
-              source: "fitness_plan",
-              workflow: "fitness_plan",
-            },
-          });
-        }
 
-        if (events.length) {
-          await prisma.progressEvent.createMany({ data: events });
+          console.log(
+            "[Exerbud] Created progress event",
+            progressType,
+            "for user",
+            user.id
+          );
         }
 
         console.log(
-          "[Exerbud] Saved messages + uploads + events for conversation",
+          "[Exerbud] Saved messages to DB for conversation",
           finalConversationId,
           "assistant message id:",
           lastAssistantMessageId
         );
       } catch (err) {
         console.error(
-          "[Exerbud] Failed to persist chat/uploads/events to DB:",
+          "[Exerbud] Failed to persist chat / uploads / progress to DB:",
           err && err.message ? err.message : err
         );
       }
