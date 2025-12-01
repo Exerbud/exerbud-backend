@@ -1,5 +1,18 @@
+# Node modules
 node_modules
-# Keep environment variables out of version control
+node_modules_old
+
+# OS junk
+.DS_Store
+
+# Environment variables
 .env
 
-/generated/prisma
+# Prisma generated client (optional but recommended)
+generated/prisma
+
+# Vercel build output
+.vercel
+
+# Lock files inside node_modules
+node_modules/.package-lock.json
