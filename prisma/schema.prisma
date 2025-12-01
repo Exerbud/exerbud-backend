@@ -2,24 +2,20 @@
 
 datasource db {
   provider = "postgresql"
-  // ⬆️ NO url line here at all
+  url      = env("DATABASE_URL")
 }
 
 generator client {
   provider = "prisma-client-js"
 }
 
-
-/**
- * USERS
- * Tracks a unique Exerbud user (Shopify customer or guest)
- */
+// USERS
 model User {
-  id            String           @id @default(cuid())
-  externalId    String           @unique // e.g. "shopify:12345" or "guest:uuid"
-  email         String?          @unique
-  createdAt     DateTime         @default(now())
-  lastSeenAt    DateTime         @updatedAt
+  id         String   @id @default(cuid())
+  externalId String   @unique
+  email      String?  @unique
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @updatedAt
 
   conversations Conversation[]
   uploads       Upload[]
@@ -27,77 +23,63 @@ model User {
   profileMemory UserProfileMemory?
 }
 
-/**
- * CONVERSATIONS
- * One chat “thread” in the widget
- */
+// CONVERSATIONS
 model Conversation {
-  id            String           @id @default(cuid())
-  user          User             @relation(fields: [userId], references: [id])
-  userId        String
-  startedAt     DateTime         @default(now())
-  endedAt       DateTime?
-  source        String           @default("shopify_widget")
-  coachProfile  CoachProfile?
-  workflow      Workflow?
+  id           String        @id @default(cuid())
+  user         User          @relation(fields: [userId], references: [id])
+  userId       String
+  startedAt    DateTime      @default(now())
+  endedAt      DateTime?
+  source       String        @default("shopify_widget")
+  coachProfile CoachProfile?
+  workflow     Workflow?
 
-  messages      Message[]
-  uploads       Upload[]
-  events        ProgressEvent[]
+  messages Message[]
+  uploads  Upload[]
+  events   ProgressEvent[]
 }
 
-/**
- * MESSAGES
- * Individual user/assistant turns in a conversation
- */
+// MESSAGES
 model Message {
-  id             String         @id @default(cuid())
-  conversation   Conversation   @relation(fields: [conversationId], references: [id])
+  id             String       @id @default(cuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
   conversationId String
   userId         String?
   role           MessageRole
   content        String
-  createdAt      DateTime       @default(now())
+  createdAt      DateTime     @default(now())
 
-  events         ProgressEvent[]
+  events ProgressEvent[]
 }
 
-/**
- * UPLOADS
- * Files and photos attached to messages
- */
+// UPLOADS
 model Upload {
-  id             String         @id @default(cuid())
-  user           User           @relation(fields: [userId], references: [id])
+  id             String        @id @default(cuid())
+  user           User          @relation(fields: [userId], references: [id])
   userId         String
-  conversation   Conversation?  @relation(fields: [conversationId], references: [id])
+  conversation   Conversation? @relation(fields: [conversationId], references: [id])
   conversationId String?
   url            String
-  type           String         // "image/jpeg", "application/pdf", etc.
+  type           String
   workflow       Workflow?
-  createdAt      DateTime       @default(now())
+  createdAt      DateTime      @default(now())
 }
 
-/**
- * PROGRESS EVENTS
- * Structured objects extracted from chats (meal logs, body scans, plans, etc.)
- */
+// PROGRESS EVENTS
 model ProgressEvent {
-  id             String         @id @default(cuid())
-  user           User           @relation(fields: [userId], references: [id])
+  id             String        @id @default(cuid())
+  user           User          @relation(fields: [userId], references: [id])
   userId         String
-  conversation   Conversation?  @relation(fields: [conversationId], references: [id])
+  conversation   Conversation? @relation(fields: [conversationId], references: [id])
   conversationId String?
-  message        Message?       @relation(fields: [messageId], references: [id])
+  message        Message?      @relation(fields: [messageId], references: [id])
   messageId      String?
   type           ProgressType
   payload        Json
-  createdAt      DateTime       @default(now())
+  createdAt      DateTime      @default(now())
 }
 
-/**
- * LONG-TERM PROFILE MEMORY
- */
+// USER PROFILE MEMORY
 model UserProfileMemory {
   id             String   @id @default(cuid())
   user           User     @relation(fields: [userId], references: [id])
@@ -111,8 +93,7 @@ model UserProfileMemory {
   updatedAt      DateTime @updatedAt
 }
 
-/* ------------------ ENUMS ------------------ */
-
+// ENUMS
 enum MessageRole {
   user
   assistant
