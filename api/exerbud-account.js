@@ -148,11 +148,17 @@ module.exports = async function handler(req, res) {
             },
           },
           orderBy: { createdAt: "desc" },
-          take: 10,
+
+          // IMPORTANT: return a big chunk; frontend paginates 5 at a time
+          take: 250, // tweak this if you want more/less history
+
           select: {
+            id: true,
             role: true,
             content: true,
             createdAt: true,
+            // If your Message model doesn't have this, remove it:
+            workflow: true,
           },
         });
       }
@@ -381,8 +387,11 @@ module.exports = async function handler(req, res) {
       lastMessageAtIso,
       lastMessageAtHuman,
       recentMessages: recentMessages.map((m) => ({
+        id: m.id,
+        messageId: m.id,                 // for deep links from dashboard
         role: m.role,
         content: m.content,
+        workflow: m.workflow || null,    // remove if you don't have this column
         createdAt: m.createdAt.toISOString(),
       })),
       summary,
