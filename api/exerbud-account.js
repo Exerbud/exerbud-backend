@@ -23,6 +23,79 @@ function getPrisma() {
   return prismaInstance;
 }
 
+// --------------------------------------------------------------
+// Helpers to classify messages for "This Week at a Glance"
+// --------------------------------------------------------------
+
+function isMealLikeFromContent(content) {
+  if (!content) return false;
+  const lower = content.toLowerCase();
+
+  // Strong phrases from vision-style outputs
+  if (lower.includes("analysis of the food items in the image")) return true;
+  if (lower.includes("here's the analysis of the food items in the image")) return true;
+  if (lower.includes("here is the analysis of the food items in the image")) return true;
+  if (lower.includes("here's the analysis of this meal")) return true;
+  if (lower.includes("here is the analysis of this meal")) return true;
+
+  // New phrases you’re seeing in real data
+  if (lower.includes("here's the analysis of your plate")) return true;
+  if (lower.includes("here is the analysis of your plate")) return true;
+  if (lower.includes("analysis of your plate")) return true;
+  if (lower.includes("food items and approximate portion sizes")) return true;
+  if (lower.includes("approximate portion sizes")) return true;
+
+  // Singular “food item in your image”
+  if (lower.includes("analysis of the food item in your image")) return true;
+  if (lower.includes("here's the analysis of the food item in your image"))
+    return true;
+  if (lower.includes("here is the analysis of the food item in your image"))
+    return true;
+  if (lower.includes("analysis of the food item in the image")) return true;
+
+  // Explicit "Food identified:"
+  if (lower.includes("food identified:")) return true;
+
+  // Heuristic: "this meal" or "plate" + kcal/calories
+  if (lower.includes("this meal") && /[0-9]{2,4}\s*(kcal|calories)/i.test(lower))
+    return true;
+  if (lower.includes("plate") && /[0-9]{2,4}\s*(kcal|calories)/i.test(lower))
+    return true;
+
+  return false;
+}
+
+function isWorkoutLikeFromContent(content) {
+  if (!content) return false;
+  const lower = content.toLowerCase();
+  return (
+    lower.includes("workout plan") ||
+    lower.includes("training plan") ||
+    lower.includes("weekly plan") ||
+    lower.includes("routine")
+  );
+}
+
+function isBodyScanLikeFromContent(content) {
+  if (!content) return false;
+  const lower = content.toLowerCase();
+  return (
+    lower.includes("body scan") ||
+    lower.includes("progress photos") ||
+    lower.includes("progress photo") ||
+    lower.includes("progress picture")
+  );
+}
+
+function extractCaloriesFromText(text) {
+  if (!text) return null;
+  const m = text.match(/([0-9]{2,4})\s*(kcal|calories)/i);
+  if (!m) return null;
+  const val = parseInt(m[1], 10);
+  if (Number.isNaN(val)) return null;
+  return val;
+}
+
 module.exports = async function handler(req, res) {
   const allowedOrigin = "https://exerbud.com";
 
@@ -192,13 +265,71 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
-    // Basic summary (zeros for now – frontend handles this)
+    // Weekly summary derived from assistant messages (last 7 days)
     // --------------------------------------------------------------
+    let mealsThisWeek = 0;
+    let bodyScansThisWeek = 0;
+    let workoutsThisWeek = 0;
+    let avgCaloriesPerDay = 0;
+
+    try {
+      if (recentMessages.length > 0) {
+        const now = new Date();
+        const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const caloriesByDay = {};
+
+        recentMessages.forEach((m) => {
+          if (m.role !== "assistant") return;
+          if (!(m.createdAt instanceof Date)) return;
+          if (m.createdAt < weekAgo) return;
+
+          const content = m.content || "";
+
+          const looksLikeMeal = isMealLikeFromContent(content);
+          const looksLikeWorkout = isWorkoutLikeFromContent(content);
+          const looksLikeBodyScan = isBodyScanLikeFromContent(content);
+
+          if (looksLikeMeal) {
+            mealsThisWeek += 1;
+            const cals = extractCaloriesFromText(content);
+            if (typeof cals === "number") {
+              const dayKey = m.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
+              caloriesByDay[dayKey] =
+                (caloriesByDay[dayKey] || 0) + cals;
+            }
+          }
+
+          if (looksLikeWorkout) {
+            workoutsThisWeek += 1;
+          }
+
+          if (looksLikeBodyScan) {
+            bodyScansThisWeek += 1;
+          }
+        });
+
+        const dayKeys = Object.keys(caloriesByDay);
+        if (dayKeys.length > 0) {
+          const totalCalories = dayKeys.reduce(
+            (sum, day) => sum + caloriesByDay[day],
+            0
+          );
+          avgCaloriesPerDay = Math.round(totalCalories / dayKeys.length);
+        }
+      }
+    } catch (err) {
+      console.error(
+        "[Exerbud] exerbud-account: error computing weekly summary from messages:",
+        err && err.message ? err.message : err
+      );
+      // leave numbers at 0 on error; response still hasData: true
+    }
+
     const summary = {
-      mealsThisWeek: 0,
-      bodyScansThisWeek: 0,
-      workoutsThisWeek: 0,
-      avgCaloriesPerDay: 0,
+      mealsThisWeek,
+      bodyScansThisWeek,
+      workoutsThisWeek,
+      avgCaloriesPerDay,
     };
 
     // --------------------------------------------------------------
