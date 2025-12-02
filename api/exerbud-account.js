@@ -47,10 +47,8 @@ function isMealLikeFromContent(content) {
 
   // Singular “food item in your image”
   if (lower.includes("analysis of the food item in your image")) return true;
-  if (lower.includes("here's the analysis of the food item in your image"))
-    return true;
-  if (lower.includes("here is the analysis of the food item in your image"))
-    return true;
+  if (lower.includes("here's the analysis of the food item in your image")) return true;
+  if (lower.includes("here is the analysis of the food item in your image")) return true;
   if (lower.includes("analysis of the food item in the image")) return true;
 
   // Explicit "Food identified:"
@@ -72,6 +70,7 @@ function isWorkoutLikeFromContent(content) {
     lower.includes("workout plan") ||
     lower.includes("training plan") ||
     lower.includes("weekly plan") ||
+    (lower.includes("workout") && lower.includes("plan")) ||
     lower.includes("routine")
   );
 }
@@ -176,7 +175,7 @@ module.exports = async function handler(req, res) {
         "[Exerbud] exerbud-account: DB error looking up user:",
         err && err.message ? err.message : err
       );
-      // Treat as "no activity yet" instead of hard error
+        // Treat as "no activity yet" instead of hard error
       return res.status(200).json({
         hasData: false,
         reason: "user_not_found",
@@ -246,12 +245,12 @@ module.exports = async function handler(req, res) {
       const last = recentMessages[0];
       if (last && last.createdAt) {
         try {
-          lastMessageAtIso = last.createdAt.toISOString();
+          lastMessageAtIso = new Date(last.createdAt).toISOString();
         } catch {
           lastMessageAtIso = null;
         }
         try {
-          lastMessageAtHuman = last.createdAt.toLocaleString("en-US", {
+          lastMessageAtHuman = new Date(last.createdAt).toLocaleString("en-US", {
             month: "short",
             day: "2-digit",
             year: "numeric",
@@ -280,8 +279,10 @@ module.exports = async function handler(req, res) {
 
         recentMessages.forEach((m) => {
           if (m.role !== "assistant") return;
-          if (!(m.createdAt instanceof Date)) return;
-          if (m.createdAt < weekAgo) return;
+
+          const created = new Date(m.createdAt);
+          if (!created || isNaN(created.getTime())) return;
+          if (created < weekAgo) return;
 
           const content = m.content || "";
 
@@ -293,7 +294,7 @@ module.exports = async function handler(req, res) {
             mealsThisWeek += 1;
             const cals = extractCaloriesFromText(content);
             if (typeof cals === "number") {
-              const dayKey = m.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
+              const dayKey = created.toISOString().slice(0, 10); // YYYY-MM-DD
               caloriesByDay[dayKey] =
                 (caloriesByDay[dayKey] || 0) + cals;
             }
@@ -345,7 +346,7 @@ module.exports = async function handler(req, res) {
         messageId: m.id, // used by dashboard + jumpToMessage
         role: m.role,
         content: m.content,
-        createdAt: m.createdAt.toISOString(),
+        createdAt: new Date(m.createdAt).toISOString(),
       })),
       summary,
       uploadsPreview: [], // not used yet by the dashboard JS
