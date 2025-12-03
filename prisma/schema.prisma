@@ -1,5 +1,3 @@
-// prisma/schema.prisma
-
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
@@ -39,6 +37,10 @@ model Conversation {
   source       String        @default("shopify_widget")
   coachProfile CoachProfile?
   workflow     Workflow?
+
+  // NEW: metadata for drawer / chat list
+  title        String?       // e.g. "Meal scan: shrimp & veggies"
+  lastMessageAt DateTime?    // updated whenever a new Message is created
 
   messages Message[]
   uploads  Upload[]
