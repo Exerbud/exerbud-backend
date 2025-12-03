@@ -22,8 +22,11 @@ model User {
   events         ProgressEvent[]
   profileMemory  UserProfileMemory?
 
-  // NEW: messages this user has chosen to hide in the account dashboard
+  // Soft-hide for dashboard
   hiddenMessages HiddenMessage[]
+
+  // NEW: pinned AI replies for dashboard
+  pinnedMessages PinnedMessage[]
 }
 
 // CONVERSATIONS
@@ -54,8 +57,11 @@ model Message {
 
   events ProgressEvent[]
 
-  // NEW: users who have hidden this message in their dashboard
+  // Users who have hidden this message in their dashboard
   hiddenBy HiddenMessage[]
+
+  // NEW: users who have pinned this message in their dashboard
+  pinnedBy PinnedMessage[]
 }
 
 // UPLOADS
@@ -99,8 +105,23 @@ model UserProfileMemory {
   updatedAt      DateTime @updatedAt
 }
 
-// NEW: HIDDEN MESSAGES (per-user soft delete for dashboard)
+// HIDDEN MESSAGES (per-user soft delete for dashboard)
 model HiddenMessage {
+  id        String   @id @default(cuid())
+
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+
+  message   Message  @relation(fields: [messageId], references: [id])
+  messageId String
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, messageId])
+}
+
+// NEW: PINNED MESSAGES (per-user pin for dashboard)
+model PinnedMessage {
   id        String   @id @default(cuid())
 
   user      User     @relation(fields: [userId], references: [id])
