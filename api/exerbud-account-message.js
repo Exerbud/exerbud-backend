@@ -1,6 +1,6 @@
 // ======================================================================
 // EXERBUD ACCOUNT MESSAGE API
-// - Handles per-user soft delete (hide from dashboard)
+// - Handles per-user soft delete + pin/unpin for dashboard
 // ======================================================================
 
 let prismaInstance = null;
@@ -72,7 +72,7 @@ module.exports = async function handler(req, res) {
     const externalId = body?.externalId || null;
     const email      = body?.email || null;
 
-    if (!action || action !== "delete") {
+    if (!action || !["delete", "pin", "unpin"].includes(action)) {
       return res.status(400).json({ ok: false, error: "unsupported_action" });
     }
 
@@ -144,44 +144,123 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
-    // Soft delete: create (or confirm) HiddenMessage record
+    // Execute action
     // --------------------------------------------------------------
-    try {
-      // Using upsert to avoid unique constraint errors if it already exists
-      await prisma.hiddenMessage.upsert({
-        where: {
-          userId_messageId: {
+    if (action === "delete") {
+      // Soft delete: create (or confirm) HiddenMessage record
+      try {
+        await prisma.hiddenMessage.upsert({
+          where: {
+            userId_messageId: {
+              userId: user.id,
+              messageId: message.id,
+            },
+          },
+          update: {},
+          create: {
             userId: user.id,
             messageId: message.id,
           },
-        },
-        update: {},
-        create: {
-          userId: user.id,
-          messageId: message.id,
-        },
-      });
+        });
 
-      console.log(
-        "[Exerbud] exerbud-account-message: hidden message",
-        message.id,
-        "for user",
-        user.id
-      );
-    } catch (err) {
-      console.error(
-        "[Exerbud] exerbud-account-message: error creating HiddenMessage:",
-        err && err.message ? err.message : err
-      );
-      return res.status(200).json({
-        ok: false,
-        reason: "hidden_message_error",
-      });
+        console.log(
+          "[Exerbud] exerbud-account-message: hidden message",
+          message.id,
+          "for user",
+          user.id
+        );
+
+        return res.status(200).json({
+          ok: true,
+          softDeleted: true,
+        });
+      } catch (err) {
+        console.error(
+          "[Exerbud] exerbud-account-message: error creating HiddenMessage:",
+          err && err.message ? err.message : err
+        );
+        return res.status(200).json({
+          ok: false,
+          reason: "hidden_message_error",
+        });
+      }
     }
 
+    if (action === "pin") {
+      try {
+        await prisma.pinnedMessage.upsert({
+          where: {
+            userId_messageId: {
+              userId: user.id,
+              messageId: message.id,
+            },
+          },
+          update: {},
+          create: {
+            userId: user.id,
+            messageId: message.id,
+          },
+        });
+
+        console.log(
+          "[Exerbud] exerbud-account-message: pinned message",
+          message.id,
+          "for user",
+          user.id
+        );
+
+        return res.status(200).json({
+          ok: true,
+          pinned: true,
+        });
+      } catch (err) {
+        console.error(
+          "[Exerbud] exerbud-account-message: error creating PinnedMessage:",
+          err && err.message ? err.message : err
+        );
+        return res.status(200).json({
+          ok: false,
+          reason: "pinned_message_error",
+        });
+      }
+    }
+
+    if (action === "unpin") {
+      try {
+        await prisma.pinnedMessage.deleteMany({
+          where: {
+            userId: user.id,
+            messageId: message.id,
+          },
+        });
+
+        console.log(
+          "[Exerbud] exerbud-account-message: unpinned message",
+          message.id,
+          "for user",
+          user.id
+        );
+
+        return res.status(200).json({
+          ok: true,
+          unpinned: true,
+        });
+      } catch (err) {
+        console.error(
+          "[Exerbud] exerbud-account-message: error deleting PinnedMessage:",
+          err && err.message ? err.message : err
+        );
+        return res.status(200).json({
+          ok: false,
+          reason: "unpinned_message_error",
+        });
+      }
+    }
+
+    // Shouldn't reach here
     return res.status(200).json({
-      ok: true,
-      softDeleted: true,
+      ok: false,
+      reason: "unhandled_action",
     });
   } catch (error) {
     console.error("Exerbud account-message API error (top-level):", error);

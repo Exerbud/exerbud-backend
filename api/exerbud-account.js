@@ -1,5 +1,5 @@
 // ======================================================================
-// EXERBUD ACCOUNT SUMMARY API (with soft-delete + safe fallback)
+// EXERBUD ACCOUNT SUMMARY API (with soft-delete + pinned insights)
 // ======================================================================
 
 let prismaInstance = null;
@@ -182,6 +182,27 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
+    // Load pinned message IDs (if table exists)
+    // --------------------------------------------------------------
+    let pinnedMessageIds = [];
+    let pinSupported = true;
+
+    try {
+      const pinnedRows = await prisma.pinnedMessage.findMany({
+        where: { userId: user.id },
+        select: { messageId: true },
+      });
+      pinnedMessageIds = pinnedRows.map((r) => r.messageId);
+    } catch (e) {
+      pinSupported = false;
+      pinnedMessageIds = [];
+      console.warn(
+        "[Exerbud] PinnedMessage not available; pinning disabled for now:",
+        e && e.message ? e.message : e
+      );
+    }
+
+    // --------------------------------------------------------------
     // Build WHERE + soft-delete support
     // --------------------------------------------------------------
     const baseWhere = {
@@ -193,8 +214,6 @@ module.exports = async function handler(req, res) {
     let messagesWhere = baseWhere;
     let softDeleteSupported = true;
 
-    // Try a tiny query that touches HiddenMessage.
-    // If it explodes, we know migrations / client aren’t in sync yet.
     try {
       await prisma.hiddenMessage.count({
         where: { userId: user.id },
@@ -211,7 +230,7 @@ module.exports = async function handler(req, res) {
     } catch (e) {
       softDeleteSupported = false;
       console.warn(
-        "[Exerbud] HiddenMessage not available yet; falling back to no soft-delete:",
+        "[Exerbud] HiddenMessage not available; no soft-delete filter:",
         e && e.message ? e.message : e
       );
       messagesWhere = baseWhere;
@@ -368,6 +387,8 @@ module.exports = async function handler(req, res) {
       summary,
       uploadsPreview: [],
       softDeleteSupported,
+      pinSupported,
+      pinnedMessageIds,
     });
   } catch (error) {
     console.error("Exerbud account API error (top-level):", error);
