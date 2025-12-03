@@ -1,7 +1,6 @@
 // ======================================================================
 // EXERBUD ACCOUNT MESSAGE API
-// - Soft delete / "hide from dashboard" support
-// - Called by the account dashboard when user clicks "Delete from list"
+// - Handles per-user soft delete (hide from dashboard)
 // ======================================================================
 
 let prismaInstance = null;
@@ -32,7 +31,7 @@ module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
 
   try {
-    // Preflight
+    // CORS preflight
     if (req.method === "OPTIONS") {
       return res.status(200).end();
     }
@@ -43,9 +42,10 @@ module.exports = async function handler(req, res) {
     }
 
     const prisma = getPrisma();
+
     if (!prisma || !process.env.DATABASE_URL) {
       console.log(
-        "[Exerbud] exerbud-account-message: prisma/DATABASE_URL missing, persistence disabled"
+        "[Exerbud] exerbud-account-message: prisma/DATABASE_URL missing"
       );
       return res.status(200).json({
         ok: false,
@@ -53,37 +53,45 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // ------------------------------------------------------------------
-    // Parse JSON body
-    // ------------------------------------------------------------------
-    let body = {};
+    // --------------------------------------------------------------
+    // Parse body
+    // --------------------------------------------------------------
+    let body = null;
     try {
-      body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+      body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     } catch (e) {
       console.error(
         "[Exerbud] exerbud-account-message: invalid JSON body",
         e && e.message ? e.message : e
       );
-      return res.status(400).json({ ok: false, error: "Invalid JSON body" });
+      return res.status(400).json({ ok: false, error: "invalid_json" });
     }
 
-    const { action, messageId, externalId, email } = body || {};
+    const action     = body?.action;
+    const messageId  = body?.messageId;
+    const externalId = body?.externalId || null;
+    const email      = body?.email || null;
+
+    if (!action || action !== "delete") {
+      return res.status(400).json({ ok: false, error: "unsupported_action" });
+    }
 
     if (!messageId) {
-      return res.status(400).json({ ok: false, error: "Missing messageId" });
-    }
-    if (!externalId && !email) {
-      return res.status(400).json({ ok: false, error: "Missing identity" });
+      return res.status(400).json({ ok: false, error: "missing_message_id" });
     }
 
-    // ------------------------------------------------------------------
-    // Look up user
-    // ------------------------------------------------------------------
+    if (!externalId && !email) {
+      return res.status(400).json({ ok: false, error: "missing_identity" });
+    }
+
+    // --------------------------------------------------------------
+    // Find the user (same logic as exerbud-account.js)
+    // --------------------------------------------------------------
     let user = null;
     try {
       const whereClauses = [];
       if (externalId) whereClauses.push({ externalId });
-      if (email) whereClauses.push({ email });
+      if (email)      whereClauses.push({ email });
 
       user = await prisma.user.findFirst({
         where: { OR: whereClauses },
@@ -96,7 +104,7 @@ module.exports = async function handler(req, res) {
       );
       return res.status(200).json({
         ok: false,
-        reason: "user_lookup_failed",
+        reason: "user_lookup_error",
       });
     }
 
@@ -111,67 +119,69 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // ------------------------------------------------------------------
-    // Actions
-    // ------------------------------------------------------------------
-    const normalizedAction = (action || "").toLowerCase();
+    // --------------------------------------------------------------
+    // Ensure the message belongs to one of this user's conversations
+    // --------------------------------------------------------------
+    const message = await prisma.message.findFirst({
+      where: {
+        id: messageId,
+        conversation: {
+          userId: user.id,
+        },
+      },
+      select: { id: true },
+    });
 
-    // Treat both "delete" and "hide" as "hide from dashboard"
-    if (normalizedAction === "delete" || normalizedAction === "hide") {
-      try {
-        await prisma.hiddenMessage.upsert({
-          where: {
-            userId_messageId: {
-              userId: user.id,
-              messageId,
-            },
-          },
-          create: {
-            userId: user.id,
-            messageId,
-          },
-          update: {}, // nothing to update, just ensure row exists
-        });
-
-        return res.status(200).json({ ok: true, action: "hidden" });
-      } catch (err) {
-        console.error(
-          "[Exerbud] exerbud-account-message: error hiding message:",
-          err && err.message ? err.message : err
-        );
-        return res.status(200).json({
-          ok: false,
-          reason: "db_error_hide",
-        });
-      }
+    if (!message) {
+      console.log(
+        "[Exerbud] exerbud-account-message: message not found or not owned by user",
+        messageId
+      );
+      return res.status(200).json({
+        ok: false,
+        reason: "message_not_found",
+      });
     }
 
-    // Optional: support "unhide" in future if you want it
-    if (normalizedAction === "unhide") {
-      try {
-        await prisma.hiddenMessage.deleteMany({
-          where: {
+    // --------------------------------------------------------------
+    // Soft delete: create (or confirm) HiddenMessage record
+    // --------------------------------------------------------------
+    try {
+      // Using upsert to avoid unique constraint errors if it already exists
+      await prisma.hiddenMessage.upsert({
+        where: {
+          userId_messageId: {
             userId: user.id,
-            messageId,
+            messageId: message.id,
           },
-        });
-        return res.status(200).json({ ok: true, action: "unhidden" });
-      } catch (err) {
-        console.error(
-          "[Exerbud] exerbud-account-message: error unhiding message:",
-          err && err.message ? err.message : err
-        );
-        return res.status(200).json({
-          ok: false,
-          reason: "db_error_unhide",
-        });
-      }
+        },
+        update: {},
+        create: {
+          userId: user.id,
+          messageId: message.id,
+        },
+      });
+
+      console.log(
+        "[Exerbud] exerbud-account-message: hidden message",
+        message.id,
+        "for user",
+        user.id
+      );
+    } catch (err) {
+      console.error(
+        "[Exerbud] exerbud-account-message: error creating HiddenMessage:",
+        err && err.message ? err.message : err
+      );
+      return res.status(200).json({
+        ok: false,
+        reason: "hidden_message_error",
+      });
     }
 
-    // Unknown action
-    return res.status(400).json({
-      ok: false,
-      error: "Unknown action",
+    return res.status(200).json({
+      ok: true,
+      softDeleted: true,
     });
   } catch (error) {
     console.error("Exerbud account-message API error (top-level):", error);
