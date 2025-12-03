@@ -1,8 +1,5 @@
 // ======================================================================
-// EXERBUD ACCOUNT SUMMARY API (with soft-delete support)
-// - Used by /account dashboard
-// - Returns recent Exerbud AI activity + weekly stats
-// - Respects per-user HiddenMessage soft deletes
+// EXERBUD ACCOUNT SUMMARY API (with soft-delete + safe fallback)
 // ======================================================================
 
 let prismaInstance = null;
@@ -31,30 +28,25 @@ function isMealLikeFromContent(content) {
   if (!content) return false;
   const lower = content.toLowerCase();
 
-  // Strong phrases from vision-style outputs
   if (lower.includes("analysis of the food items in the image")) return true;
   if (lower.includes("here's the analysis of the food items in the image")) return true;
   if (lower.includes("here is the analysis of the food items in the image")) return true;
   if (lower.includes("here's the analysis of this meal")) return true;
   if (lower.includes("here is the analysis of this meal")) return true;
 
-  // New phrases you’re seeing in real data
   if (lower.includes("here's the analysis of your plate")) return true;
   if (lower.includes("here is the analysis of your plate")) return true;
   if (lower.includes("analysis of your plate")) return true;
   if (lower.includes("food items and approximate portion sizes")) return true;
   if (lower.includes("approximate portion sizes")) return true;
 
-  // Singular “food item in your image”
   if (lower.includes("analysis of the food item in your image")) return true;
   if (lower.includes("here's the analysis of the food item in your image")) return true;
   if (lower.includes("here is the analysis of the food item in your image")) return true;
   if (lower.includes("analysis of the food item in the image")) return true;
 
-  // Explicit "Food identified:"
   if (lower.includes("food identified:")) return true;
 
-  // Heuristic: "this meal" or "plate" + kcal/calories
   if (lower.includes("this meal") && /[0-9]{2,4}\s*(kcal|calories)/i.test(lower))
     return true;
   if (lower.includes("plate") && /[0-9]{2,4}\s*(kcal|calories)/i.test(lower))
@@ -105,7 +97,6 @@ module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
 
   try {
-    // Preflight
     if (req.method === "OPTIONS") {
       return res.status(200).end();
     }
@@ -116,7 +107,7 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
-    // Parse query params safely from req.url
+    // Parse identity
     // --------------------------------------------------------------
     let externalId = null;
     let email = null;
@@ -136,9 +127,7 @@ module.exports = async function handler(req, res) {
     }
 
     if (!externalId && !email) {
-      console.log(
-        "[Exerbud] exerbud-account: missing identity (no externalId or email)"
-      );
+      console.log("[Exerbud] exerbud-account: missing identity");
       return res.status(200).json({
         hasData: false,
         reason: "missing_identity",
@@ -158,7 +147,7 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
-    // Look up the user
+    // Look up user
     // --------------------------------------------------------------
     let user = null;
     try {
@@ -175,7 +164,6 @@ module.exports = async function handler(req, res) {
         "[Exerbud] exerbud-account: DB error looking up user:",
         err && err.message ? err.message : err
       );
-      // Treat as "no activity yet" instead of hard error
       return res.status(200).json({
         hasData: false,
         reason: "user_not_found",
@@ -194,22 +182,43 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
-    // Base WHERE for this user's messages, respecting HiddenMessage
+    // Build WHERE + soft-delete support
     // --------------------------------------------------------------
-    const messagesWhere = {
+    const baseWhere = {
       conversation: {
         userId: user.id,
       },
-      // SOFT DELETE: exclude messages the user has hidden in dashboard
-      hiddenBy: {
-        none: {
-          userId: user.id,
-        },
-      },
     };
 
+    let messagesWhere = baseWhere;
+    let softDeleteSupported = true;
+
+    // Try a tiny query that touches HiddenMessage.
+    // If it explodes, we know migrations / client aren’t in sync yet.
+    try {
+      await prisma.hiddenMessage.count({
+        where: { userId: user.id },
+      });
+
+      messagesWhere = {
+        ...baseWhere,
+        hiddenBy: {
+          none: {
+            userId: user.id,
+          },
+        },
+      };
+    } catch (e) {
+      softDeleteSupported = false;
+      console.warn(
+        "[Exerbud] HiddenMessage not available yet; falling back to no soft-delete:",
+        e && e.message ? e.message : e
+      );
+      messagesWhere = baseWhere;
+    }
+
     // --------------------------------------------------------------
-    // Load messages for that user (up to 250 for pagination)
+    // Load messages (up to 250) with that WHERE
     // --------------------------------------------------------------
     let totalMessages = 0;
     let recentMessages = [];
@@ -223,7 +232,7 @@ module.exports = async function handler(req, res) {
         recentMessages = await prisma.message.findMany({
           where: messagesWhere,
           orderBy: { createdAt: "desc" },
-          take: 250, // frontend paginates 5 at a time
+          take: 250,
           select: {
             id: true,
             role: true,
@@ -237,13 +246,12 @@ module.exports = async function handler(req, res) {
         "[Exerbud] exerbud-account: DB error loading messages:",
         err && err.message ? err.message : err
       );
-      // Fall back to "no messages" instead of db_error
       totalMessages = 0;
       recentMessages = [];
     }
 
     // --------------------------------------------------------------
-    // Derive last message timestamps (may be null if no messages)
+    // Last message timestamps
     // --------------------------------------------------------------
     let lastMessageAtIso = null;
     let lastMessageAtHuman = null;
@@ -257,13 +265,16 @@ module.exports = async function handler(req, res) {
           lastMessageAtIso = null;
         }
         try {
-          lastMessageAtHuman = new Date(last.createdAt).toLocaleString("en-US", {
-            month: "short",
-            day: "2-digit",
-            year: "numeric",
-            hour: "2-digit",
-            minute: "2-digit",
-          });
+          lastMessageAtHuman = new Date(last.createdAt).toLocaleString(
+            "en-US",
+            {
+              month: "short",
+              day: "2-digit",
+              year: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            }
+          );
         } catch {
           lastMessageAtHuman = lastMessageAtIso;
         }
@@ -301,7 +312,7 @@ module.exports = async function handler(req, res) {
             mealsThisWeek += 1;
             const cals = extractCaloriesFromText(content);
             if (typeof cals === "number") {
-              const dayKey = created.toISOString().slice(0, 10); // YYYY-MM-DD
+              const dayKey = created.toISOString().slice(0, 10);
               caloriesByDay[dayKey] =
                 (caloriesByDay[dayKey] || 0) + cals;
             }
@@ -330,7 +341,6 @@ module.exports = async function handler(req, res) {
         "[Exerbud] exerbud-account: error computing weekly summary from messages:",
         err && err.message ? err.message : err
       );
-      // leave numbers at 0 on error; response still hasData: true
     }
 
     const summary = {
@@ -350,13 +360,14 @@ module.exports = async function handler(req, res) {
       lastMessageAtHuman,
       recentMessages: recentMessages.map((m) => ({
         id: m.id,
-        messageId: m.id, // used by dashboard + jumpToMessage
+        messageId: m.id,
         role: m.role,
         content: m.content,
         createdAt: new Date(m.createdAt).toISOString(),
       })),
       summary,
-      uploadsPreview: [], // not used yet by the dashboard JS
+      uploadsPreview: [],
+      softDeleteSupported,
     });
   } catch (error) {
     console.error("Exerbud account API error (top-level):", error);
