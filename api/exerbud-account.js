@@ -2,7 +2,7 @@
 // EXERBUD ACCOUNT SUMMARY API (SIMPLIFIED, STABLE VERSION)
 // - Used by /account dashboard
 // - Returns recent Exerbud AI activity + basic stats
-// - No ProgressEvent / Upload dependencies (avoids extra DB errors)
+// - Supports per-user soft delete via HiddenMessage
 // ======================================================================
 
 let prismaInstance = null;
@@ -175,7 +175,7 @@ module.exports = async function handler(req, res) {
         "[Exerbud] exerbud-account: DB error looking up user:",
         err && err.message ? err.message : err
       );
-        // Treat as "no activity yet" instead of hard error
+      // Treat as "no activity yet" instead of hard error
       return res.status(200).json({
         hasData: false,
         reason: "user_not_found",
@@ -195,6 +195,7 @@ module.exports = async function handler(req, res) {
 
     // --------------------------------------------------------------
     // Load messages for that user (up to 250 for pagination)
+    // **IMPORTANT**: Exclude messages the user has soft-deleted
     // --------------------------------------------------------------
     let totalMessages = 0;
     let recentMessages = [];
@@ -205,6 +206,12 @@ module.exports = async function handler(req, res) {
           conversation: {
             userId: user.id,
           },
+          // NEW: exclude messages hidden by this user
+          hiddenBy: {
+            none: {
+              userId: user.id,
+            },
+          },
         },
       });
 
@@ -213,6 +220,12 @@ module.exports = async function handler(req, res) {
           where: {
             conversation: {
               userId: user.id,
+            },
+            // NEW: exclude messages hidden by this user
+            hiddenBy: {
+              none: {
+                userId: user.id,
+              },
             },
           },
           orderBy: { createdAt: "desc" },

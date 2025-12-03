@@ -17,10 +17,13 @@ model User {
   createdAt  DateTime @default(now())
   lastSeenAt DateTime @updatedAt
 
-  conversations Conversation[]
-  uploads       Upload[]
-  events        ProgressEvent[]
-  profileMemory UserProfileMemory?
+  conversations  Conversation[]
+  uploads        Upload[]
+  events         ProgressEvent[]
+  profileMemory  UserProfileMemory?
+
+  // NEW: messages this user has chosen to hide in the account dashboard
+  hiddenMessages HiddenMessage[]
 }
 
 // CONVERSATIONS
@@ -50,6 +53,9 @@ model Message {
   createdAt      DateTime     @default(now())
 
   events ProgressEvent[]
+
+  // NEW: users who have hidden this message in their dashboard
+  hiddenBy HiddenMessage[]
 }
 
 // UPLOADS
@@ -91,6 +97,21 @@ model UserProfileMemory {
   data           Json?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+}
+
+// NEW: HIDDEN MESSAGES (per-user soft delete for dashboard)
+model HiddenMessage {
+  id        String   @id @default(cuid())
+
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+
+  message   Message  @relation(fields: [messageId], references: [id])
+  messageId String
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, messageId])
 }
 
 // ENUMS
