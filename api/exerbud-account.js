@@ -1,8 +1,8 @@
 // ======================================================================
-// EXERBUD ACCOUNT SUMMARY API (SIMPLIFIED, STABLE VERSION)
+// EXERBUD ACCOUNT SUMMARY API (with soft-delete support)
 // - Used by /account dashboard
-// - Returns recent Exerbud AI activity + basic stats
-// - Supports per-user soft delete via HiddenMessage
+// - Returns recent Exerbud AI activity + weekly stats
+// - Respects per-user HiddenMessage soft deletes
 // ======================================================================
 
 let prismaInstance = null;
@@ -194,40 +194,34 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------
+    // Base WHERE for this user's messages, respecting HiddenMessage
+    // --------------------------------------------------------------
+    const messagesWhere = {
+      conversation: {
+        userId: user.id,
+      },
+      // SOFT DELETE: exclude messages the user has hidden in dashboard
+      hiddenBy: {
+        none: {
+          userId: user.id,
+        },
+      },
+    };
+
+    // --------------------------------------------------------------
     // Load messages for that user (up to 250 for pagination)
-    // **IMPORTANT**: Exclude messages the user has soft-deleted
     // --------------------------------------------------------------
     let totalMessages = 0;
     let recentMessages = [];
 
     try {
       totalMessages = await prisma.message.count({
-        where: {
-          conversation: {
-            userId: user.id,
-          },
-          // NEW: exclude messages hidden by this user
-          hiddenBy: {
-            none: {
-              userId: user.id,
-            },
-          },
-        },
+        where: messagesWhere,
       });
 
       if (totalMessages > 0) {
         recentMessages = await prisma.message.findMany({
-          where: {
-            conversation: {
-              userId: user.id,
-            },
-            // NEW: exclude messages hidden by this user
-            hiddenBy: {
-              none: {
-                userId: user.id,
-              },
-            },
-          },
+          where: messagesWhere,
           orderBy: { createdAt: "desc" },
           take: 250, // frontend paginates 5 at a time
           select: {
