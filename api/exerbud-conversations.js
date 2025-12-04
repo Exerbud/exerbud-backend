@@ -123,7 +123,7 @@ export default async function handler(req, res) {
     }
 
     // --- 2) Fetch a bigger pool of recent conversations for this user ---
-    // We’ll filter & dedupe down to max 4 below.
+    // We’ll filter & dedupe down to a smaller set below.
     const rawConversations = await prisma.conversation.findMany({
       where: {
         userId: user.id,
@@ -137,9 +137,10 @@ export default async function handler(req, res) {
       take: 20,
     });
 
-    // --- 3) Filter: skip never-used threads, dedupe by title, limit to 4 ---
+    // --- 3) Filter: skip never-used threads, dedupe by title, limit to MAX_CONVERSATIONS ---
     const seenTitles = new Set();
     const finalConversations = [];
+    const MAX_CONVERSATIONS = 12; // increased from 4 to support paging in the drawer
 
     for (const conv of rawConversations) {
       const hasActivity = Boolean(conv.lastMessageAt || conv.startedAt);
@@ -154,7 +155,7 @@ export default async function handler(req, res) {
       seenTitles.add(key);
       finalConversations.push({ conv, title });
 
-      if (finalConversations.length >= 4) break; // show only last 4
+      if (finalConversations.length >= MAX_CONVERSATIONS) break;
     }
 
     // --- 4) Shape the payload so it matches the frontend’s expectations ---
