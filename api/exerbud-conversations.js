@@ -134,13 +134,13 @@ export default async function handler(req, res) {
         // Fallback if lastMessageAt is null
         { startedAt: "desc" },
       ],
-      take: 20,
+      take: 40, // was 20 – grab a bit more to dedupe from
     });
 
     // --- 3) Filter: skip never-used threads, dedupe by title, limit to MAX_CONVERSATIONS ---
     const seenTitles = new Set();
     const finalConversations = [];
-    const MAX_CONVERSATIONS = 12; // increased from 4 to support paging in the drawer
+    const MAX_CONVERSATIONS = 20; // was 12 – match drawer MAX_ITEMS_TOTAL
 
     for (const conv of rawConversations) {
       const hasActivity = Boolean(conv.lastMessageAt || conv.startedAt);
