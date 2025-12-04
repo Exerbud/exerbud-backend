@@ -123,7 +123,6 @@ export default async function handler(req, res) {
     }
 
     // --- 2) Fetch a bigger pool of recent conversations for this user ---
-    // We’ll filter & dedupe down to a smaller set below.
     const rawConversations = await prisma.conversation.findMany({
       where: {
         userId: user.id,
@@ -134,34 +133,20 @@ export default async function handler(req, res) {
         // Fallback if lastMessageAt is null
         { startedAt: "desc" },
       ],
-      take: 40, // was 20 – grab a bit more to dedupe from
+      take: 40, // grab a bit more, then trim to 20 below
     });
 
-    // --- 3) Filter: skip never-used threads, dedupe by title, limit to MAX_CONVERSATIONS ---
-    const seenTitles = new Set();
-    const finalConversations = [];
-    const MAX_CONVERSATIONS = 20; // was 12 – match drawer MAX_ITEMS_TOTAL
+    // --- 3) Filter out totally empty threads, then cap at 20 ---
+    const MAX_CONVERSATIONS = 20;
 
-    for (const conv of rawConversations) {
-      const hasActivity = Boolean(conv.lastMessageAt || conv.startedAt);
-      if (!hasActivity) continue; // skip totally empty rows just in case
-
-      const title = buildConversationTitle(conv);
-      const key = title.trim().toLowerCase();
-
-      if (!key) continue; // extremely defensive
-      if (seenTitles.has(key)) continue; // avoid duplicate-looking pills
-
-      seenTitles.add(key);
-      finalConversations.push({ conv, title });
-
-      if (finalConversations.length >= MAX_CONVERSATIONS) break;
-    }
+    const usableConversations = rawConversations
+      .filter((conv) => Boolean(conv.lastMessageAt || conv.startedAt))
+      .slice(0, MAX_CONVERSATIONS);
 
     // --- 4) Shape the payload so it matches the frontend’s expectations ---
-    const payload = finalConversations.map(({ conv, title }) => ({
+    const payload = usableConversations.map((conv) => ({
       id: conv.id,
-      title, // already nicely formatted
+      title: buildConversationTitle(conv),
       startedAt: conv.startedAt,
       lastMessageAt: conv.lastMessageAt,
       coachProfile: conv.coachProfile,
