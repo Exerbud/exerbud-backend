@@ -4,8 +4,9 @@ import prisma from "../lib/prisma";
 import { findOrCreateUser } from "../lib/exerbudPersistence";
 import logger from "../utils/logger";
 
-// Very simple CORS helper (you can tighten origins later if you want)
+// Basic CORS for Shopify → Vercel
 function setCors(res) {
+  // You can tighten this later to your exact shop domain
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -14,9 +15,9 @@ function setCors(res) {
 export default async function handler(req, res) {
   setCors(res);
 
-  // Handle preflight
+  // Handle the Shopify preflight OPTIONS request
   if (req.method === "OPTIONS") {
-    return res.status(204).end();
+    return res.status(200).end();
   }
 
   if (req.method !== "POST") {
@@ -24,41 +25,51 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { userExternalId, email, coachProfile, workflow } = req.body || {};
+    const { userExternalId, email, initialTitle } = req.body || {};
 
     if (!userExternalId && !email) {
-      return res.status(400).json({
-        error: "userExternalId or email is required",
-      });
+      return res
+        .status(400)
+        .json({ error: "userExternalId or email is required" });
     }
 
-    // Get or create the user
-    const user = await findOrCreateUser(userExternalId || null, email || null);
+    // Make sure we have a user record
+    const user = await findOrCreateUser({
+      externalId: userExternalId || null,
+      email: email || null,
+    });
+
+    if (!user || !user.id) {
+      return res
+        .status(500)
+        .json({ error: "Could not resolve or create user record" });
+    }
 
     // Create a new conversation row
     const conversation = await prisma.conversation.create({
       data: {
-        userId: user.id,
-        source: "shopify_widget",
-        coachProfile: coachProfile || null,
-        workflow: workflow || null,
-        startedAt: new Date(),
+        userId: user.id, // adjust this if your Conversation model uses a different field
+        title: initialTitle || "Exerbud AI coach",
       },
     });
 
     return res.status(200).json({
       ok: true,
       conversationId: conversation.id,
-      userExternalId: user.externalId,
+      userExternalId: user.externalId || userExternalId || null,
     });
   } catch (err) {
-    logger.error("[Exerbud] /api/exerbud-conversation-new error", {
-      error: err?.message,
-      stack: err?.stack,
-    });
+    try {
+      logger.error("[exerbud-conversation-new] Failed to create conversation", {
+        error: err?.message || String(err),
+        stack: err?.stack,
+      });
+    } catch (e) {
+      console.error("[exerbud-conversation-new] Logging failed:", e, err);
+    }
 
-    return res.status(500).json({
-      error: "Internal server error",
-    });
+    return res
+      .status(500)
+      .json({ error: "Failed to create conversation on backend" });
   }
 }
