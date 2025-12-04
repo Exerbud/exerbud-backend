@@ -14,6 +14,62 @@ prisma = global._exerbudPrisma;
 const ALLOWED_ORIGIN =
   process.env.EXERBUD_ALLOWED_ORIGIN || "https://exerbud.com";
 
+// Helper: format a short date label like "Dec 4"
+function formatLabelDate(date) {
+  if (!date) return "";
+  try {
+    return new Date(date).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return "";
+  }
+}
+
+// Helper: build a nice human title for the pill
+function buildConversationTitle(conv) {
+  const dateLabel =
+    formatLabelDate(conv.lastMessageAt || conv.startedAt) || "";
+
+  // If we already have a non-empty title in DB, prefer that
+  if (conv.title && conv.title.trim().length > 0) {
+    return conv.title.trim();
+  }
+
+  // Otherwise, infer from workflow first
+  if (conv.workflow === "food_scan") {
+    return dateLabel ? `Meal scan · ${dateLabel}` : "Meal scan";
+  }
+  if (conv.workflow === "body_scan") {
+    return dateLabel ? `Body scan · ${dateLabel}` : "Body scan";
+  }
+  if (conv.workflow === "fitness_plan") {
+    return dateLabel ? `Workout plan · ${dateLabel}` : "Workout plan";
+  }
+
+  // Then from coach profile
+  if (conv.coachProfile === "strength") {
+    return dateLabel ? `Strength coaching · ${dateLabel}` : "Strength coaching";
+  }
+  if (conv.coachProfile === "hypertrophy") {
+    return dateLabel
+      ? `Hypertrophy coaching · ${dateLabel}`
+      : "Hypertrophy coaching";
+  }
+  if (conv.coachProfile === "mobility") {
+    return dateLabel ? `Mobility coaching · ${dateLabel}` : "Mobility coaching";
+  }
+  if (conv.coachProfile === "fat_loss") {
+    return dateLabel
+      ? `Fat loss coaching · ${dateLabel}`
+      : "Fat loss coaching";
+  }
+
+  // Generic fallback
+  return dateLabel ? `Chat · ${dateLabel}` : "Chat";
+}
+
 export default async function handler(req, res) {
   // ---- CORS HEADERS (for all requests) ----
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
@@ -66,16 +122,11 @@ export default async function handler(req, res) {
       });
     }
 
-    // --- 2) Fetch recent conversations for this user ---
-    const conversations = await prisma.conversation.findMany({
+    // --- 2) Fetch a bigger pool of recent conversations for this user ---
+    // We’ll filter & dedupe down to max 4 below.
+    const rawConversations = await prisma.conversation.findMany({
       where: {
         userId: user.id,
-
-        // Only show conversations that actually have messages
-        // (hides blank auto-created threads)
-        messages: {
-          some: {}, // at least one related message
-        },
       },
       orderBy: [
         // Primary sort: lastMessageAt (most recent first)
@@ -83,14 +134,33 @@ export default async function handler(req, res) {
         // Fallback if lastMessageAt is null
         { startedAt: "desc" },
       ],
-      // Only show the most recent 4 in the pill bar
-      take: 4,
+      take: 20,
     });
 
-    // --- 3) Shape the payload so it matches the frontend’s expectations ---
-    const payload = conversations.map((conv) => ({
+    // --- 3) Filter: skip never-used threads, dedupe by title, limit to 4 ---
+    const seenTitles = new Set();
+    const finalConversations = [];
+
+    for (const conv of rawConversations) {
+      const hasActivity = Boolean(conv.lastMessageAt || conv.startedAt);
+      if (!hasActivity) continue; // skip totally empty rows just in case
+
+      const title = buildConversationTitle(conv);
+      const key = title.trim().toLowerCase();
+
+      if (!key) continue; // extremely defensive
+      if (seenTitles.has(key)) continue; // avoid duplicate-looking pills
+
+      seenTitles.add(key);
+      finalConversations.push({ conv, title });
+
+      if (finalConversations.length >= 4) break; // show only last 4
+    }
+
+    // --- 4) Shape the payload so it matches the frontend’s expectations ---
+    const payload = finalConversations.map(({ conv, title }) => ({
       id: conv.id,
-      title: conv.title,
+      title, // already nicely formatted
       startedAt: conv.startedAt,
       lastMessageAt: conv.lastMessageAt,
       coachProfile: conv.coachProfile,
