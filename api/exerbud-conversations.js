@@ -70,6 +70,12 @@ export default async function handler(req, res) {
     const conversations = await prisma.conversation.findMany({
       where: {
         userId: user.id,
+
+        // Only show conversations that actually have messages
+        // (hides blank auto-created threads)
+        messages: {
+          some: {}, // at least one related message
+        },
       },
       orderBy: [
         // Primary sort: lastMessageAt (most recent first)
@@ -77,7 +83,8 @@ export default async function handler(req, res) {
         // Fallback if lastMessageAt is null
         { startedAt: "desc" },
       ],
-      take: 10, // adjust if you want more/less in the list
+      // Only show the most recent 4 in the pill bar
+      take: 4,
     });
 
     // --- 3) Shape the payload so it matches the frontend’s expectations ---
